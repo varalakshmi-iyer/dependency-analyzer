@@ -3,13 +3,15 @@ Dependency Version Change Analyzer using Vertex AI (Gemini)
 Analyzes PR diffs to detect breaking changes between dependency versions.
 """
 
+from __future__ import annotations
+
 import re
-import json
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import List, Optional, Tuple
 
+from pydantic import BaseModel, Field
 import vertexai
 from vertexai.generative_models import GenerativeModel, GenerationConfig
 
@@ -17,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Data models
+# Enums & internal data models
 # ---------------------------------------------------------------------------
 
 class Severity(str, Enum):
@@ -26,6 +28,16 @@ class Severity(str, Enum):
     MEDIUM   = "MEDIUM"
     LOW      = "LOW"
     INFO     = "INFO"
+
+
+class ChangeType(str, Enum):
+    METHOD_REMOVED   = "METHOD_REMOVED"
+    PROPERTY_RENAMED = "PROPERTY_RENAMED"
+    API_CHANGED      = "API_CHANGED"
+    BEHAVIOR_CHANGED = "BEHAVIOR_CHANGED"
+    CONFIG_CHANGED   = "CONFIG_CHANGED"
+    DEPRECATION      = "DEPRECATION"
+    OTHER            = "OTHER"
 
 
 @dataclass
@@ -38,21 +50,21 @@ class DependencyChange:
 
 @dataclass
 class BreakingChange:
-    dependency: str
-    old_version: str
-    new_version: str
-    change_type: str        # METHOD_REMOVED | PROPERTY_RENAMED | API_CHANGED | BEHAVIOR_CHANGED | CONFIG_CHANGED | DEPRECATION | OTHER
-    description: str
-    severity: Severity
-    affected_code: Optional[str] = None
+    dependency:     str
+    old_version:    str
+    new_version:    str
+    change_type:    str
+    description:    str
+    severity:       Severity
+    affected_code:  Optional[str] = None
     migration_hint: Optional[str] = None
 
 
 @dataclass
 class AnalysisResult:
-    dependency_changes: list[DependencyChange] = field(default_factory=list)
-    breaking_changes:   list[BreakingChange]   = field(default_factory=list)
-    warnings:           list[str]              = field(default_factory=list)
+    dependency_changes: List[DependencyChange] = field(default_factory=list)
+    breaking_changes:   List[BreakingChange]   = field(default_factory=list)
+    warnings:           List[str]              = field(default_factory=list)
     summary:            str                    = ""
     safe_to_merge:      bool                   = True
 
@@ -63,6 +75,25 @@ class AnalysisResult:
     @property
     def has_breaking(self) -> bool:
         return bool(self.breaking_changes)
+
+
+# ---------------------------------------------------------------------------
+# Pydantic schema — enforced on Gemini's output via response_schema
+# ---------------------------------------------------------------------------
+
+class BreakingChangeSchema(BaseModel):
+    change_type:    ChangeType
+    description:    str
+    severity:       Severity
+    affected_code:  Optional[str] = None
+    migration_hint: Optional[str] = None
+
+
+class AnalysisResponseSchema(BaseModel):
+    breaking_changes: List[BreakingChangeSchema] = Field(default_factory=list)
+    warnings:         List[str]                  = Field(default_factory=list)
+    summary:          str
+    safe_to_merge:    bool
 
 
 # ---------------------------------------------------------------------------
@@ -85,17 +116,20 @@ _DEPENDENCY_PATTERNS = [
     # build.gradle   implementation 'group:artifact:1.0.0'
     (r"""^\-\s*(?:implementation|api|compile|testImplementation)\s+['"](?P<name>[\w\.\-\:]+):(?P<old_ver>[\d\.\w\-]+)['"]""",
      r"""^\+\s*(?:implementation|api|compile|testImplementation)\s+['"](?P<name>[\w\.\-\:]+):(?P<new_ver>[\d\.\w\-]+)['"]"""),
+    # libs.versions.toml   springBoot = "2.7.14"
+    (r'^\-\s*(?P<name>[\w\-]+)\s*=\s*"(?P<old_ver>[\d\.\w\-\+]+)"',
+     r'^\+\s*(?P<name>[\w\-]+)\s*=\s*"(?P<new_ver>[\d\.\w\-\+]+)"'),
 ]
 
 
-def parse_dependency_changes(diff: str) -> list[DependencyChange]:
+def parse_dependency_changes(diff: str) -> List[DependencyChange]:
     """Extract dependency version bumps from a unified diff string."""
-    changes: list[DependencyChange] = []
+    changes: List[DependencyChange] = []
     current_file = "unknown"
-    removed: list[str] = []
-    added:   list[str] = []
+    removed: List[str] = []
+    added:   List[str] = []
 
-    def _flush(file_name: str):
+    def _flush(file_name: str) -> None:
         for rem in removed:
             for add in added:
                 for rem_pat, add_pat in _DEPENDENCY_PATTERNS:
@@ -128,16 +162,18 @@ def parse_dependency_changes(diff: str) -> list[DependencyChange]:
     _flush(current_file)
 
     # Deduplicate
-    seen, unique = set(), []
+    seen: set = set()
+    unique: List[DependencyChange] = []
     for c in changes:
         key = (c.name, c.old_version, c.new_version)
         if key not in seen:
-            seen.add(key); unique.append(c)
+            seen.add(key)
+            unique.append(c)
     return unique
 
 
 # ---------------------------------------------------------------------------
-# Vertex AI client
+# Prompts
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = """
@@ -145,23 +181,7 @@ You are a senior software engineer specializing in library compatibility and mig
 Analyze the dependency version upgrade provided and identify breaking changes,
 deprecated APIs, renamed methods/properties, or behavioral differences.
 
-Focus ONLY on the dependency change — do NOT invent unrelated changes.
-
-Respond with a JSON object (no markdown fences) with this exact shape:
-{
-  "breaking_changes": [
-    {
-      "change_type": "METHOD_REMOVED | PROPERTY_RENAMED | API_CHANGED | BEHAVIOR_CHANGED | CONFIG_CHANGED | DEPRECATION | OTHER",
-      "description": "<clear description>",
-      "severity": "CRITICAL | HIGH | MEDIUM | LOW | INFO",
-      "affected_code": "<optional: affected usage pattern>",
-      "migration_hint": "<optional: how to migrate>"
-    }
-  ],
-  "warnings": ["<non-breaking concerns>"],
-  "summary": "<one-paragraph plain-English summary>",
-  "safe_to_merge": true | false
-}
+Focus ONLY on the dependency provided — do NOT invent unrelated changes.
 
 Severity guide:
   CRITICAL – runtime crash / data loss guaranteed
@@ -171,6 +191,21 @@ Severity guide:
   INFO     – purely informational
 """.strip()
 
+
+def _build_prompt(dep: DependencyChange, context: str) -> str:
+    return (
+        f"Dependency : {dep.name}\n"
+        f"Old version: {dep.old_version}\n"
+        f"New version: {dep.new_version}\n"
+        f"File       : {dep.file}\n\n"
+        f"Relevant diff context:\n{context or '(none)'}\n\n"
+        "Analyze this upgrade and return the result."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Vertex AI analyzer
+# ---------------------------------------------------------------------------
 
 class DependencyAnalyzer:
     """Analyzes dependency version changes in a PR diff using Vertex AI Gemini."""
@@ -183,14 +218,14 @@ class DependencyAnalyzer:
         temperature: float = 0.1,
         max_output_tokens: int = 4096,
     ):
-        self.project_id       = project_id
-        self.location         = location
-        self.model_name       = model_name
-        self.temperature      = temperature
+        self.project_id        = project_id
+        self.location          = location
+        self.model_name        = model_name
+        self.temperature       = temperature
         self.max_output_tokens = max_output_tokens
         self._model: Optional[GenerativeModel] = None
 
-    # ── private helpers ────────────────────────────────────────────────────
+    # ── private ───────────────────────────────────────────────────────────
 
     def _init_model(self) -> GenerativeModel:
         if self._model is None:
@@ -199,6 +234,7 @@ class DependencyAnalyzer:
                 model_name=self.model_name,
                 system_instruction=_SYSTEM_PROMPT,
             )
+            logger.info("Initialized Vertex AI model: %s", self.model_name)
         return self._model
 
     def _extract_diff_context(self, diff: str, dep: DependencyChange, context_lines: int = 20) -> str:
@@ -212,54 +248,52 @@ class DependencyAnalyzer:
         c = matches[0]
         return "\n".join(lines[max(0, c - context_lines): c + context_lines])
 
-    def _build_prompt(self, dep: DependencyChange, context: str) -> str:
-        return (
-            f"Dependency : {dep.name}\n"
-            f"Old version: {dep.old_version}\n"
-            f"New version: {dep.new_version}\n"
-            f"File       : {dep.file}\n\n"
-            f"Relevant diff context:\n{context or '(none)'}\n\n"
-            "Analyze the upgrade and return JSON only."
-        )
-
-    def _call_vertex(self, prompt: str) -> dict:
+    def _call_vertex(self, prompt: str) -> AnalysisResponseSchema:
+        """
+        Call Gemini with response_schema so the output is guaranteed to be
+        valid JSON matching AnalysisResponseSchema — no string manipulation needed.
+        """
         model = self._init_model()
         config = GenerationConfig(
             temperature=self.temperature,
             max_output_tokens=self.max_output_tokens,
             response_mime_type="application/json",
+            response_schema=AnalysisResponseSchema,   # Gemini enforces this schema
         )
         response = model.generate_content(prompt, generation_config=config)
-        raw = response.text.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        return json.loads(raw)
+        logger.debug("Raw Vertex response: %s", response.text)
+        return AnalysisResponseSchema.model_validate_json(response.text)
 
-    def _parse_response(self, data: dict, dep: DependencyChange):
-        breaking = []
-        for item in data.get("breaking_changes", []):
-            try:
-                sev = Severity(item.get("severity", "MEDIUM").upper())
-            except ValueError:
-                sev = Severity.MEDIUM
-            breaking.append(BreakingChange(
+    def _parse_response(
+        self,
+        data: AnalysisResponseSchema,
+        dep: DependencyChange,
+    ) -> Tuple[List[BreakingChange], List[str], str, bool]:
+        breaking = [
+            BreakingChange(
                 dependency=dep.name,
                 old_version=dep.old_version,
                 new_version=dep.new_version,
-                change_type=item.get("change_type", "OTHER"),
-                description=item.get("description", ""),
-                severity=sev,
-                affected_code=item.get("affected_code"),
-                migration_hint=item.get("migration_hint"),
-            ))
-        return (
-            breaking,
-            data.get("warnings", []),
-            data.get("summary", ""),
-            bool(data.get("safe_to_merge", True)),
+                change_type=item.change_type.value,
+                description=item.description,
+                severity=Severity(item.severity.value),
+                affected_code=item.affected_code,
+                migration_hint=item.migration_hint,
+            )
+            for item in data.breaking_changes
+        ]
+        return breaking, data.warnings, data.summary, data.safe_to_merge
+
+    def _fallback_response(self, dep: DependencyChange) -> AnalysisResponseSchema:
+        """Conservative fallback when Vertex call fails entirely."""
+        return AnalysisResponseSchema(
+            breaking_changes=[],
+            warnings=[f"Could not analyze {dep.name} — manual review recommended."],
+            summary=f"Analysis of {dep.name} {dep.old_version}→{dep.new_version} failed. Review manually.",
+            safe_to_merge=False,
         )
 
-    # ── public API ─────────────────────────────────────────────────────────
+    # ── public ────────────────────────────────────────────────────────────
 
     def analyze_diff(self, diff: str) -> AnalysisResult:
         """Full pipeline: parse diff → detect deps → call Vertex AI per change."""
@@ -271,26 +305,25 @@ class DependencyAnalyzer:
             return result
 
         logger.info("Found %d dependency change(s). Analyzing...", len(result.dependency_changes))
-        summaries, overall_safe = [], True
+        summaries: List[str] = []
+        overall_safe = True
 
         for dep in result.dependency_changes:
             logger.info("Analyzing: %s  %s → %s", dep.name, dep.old_version, dep.new_version)
             try:
-                context = self._extract_diff_context(diff, dep)
-                prompt  = self._build_prompt(dep, context)
-                data    = self._call_vertex(prompt)
-                breaking, warnings, summary, safe = self._parse_response(data, dep)
-
-                result.breaking_changes.extend(breaking)
-                result.warnings.extend(warnings)
-                summaries.append(f"[{dep.name} {dep.old_version}→{dep.new_version}] {summary}")
-                if not safe:
-                    overall_safe = False
-
+                context  = self._extract_diff_context(diff, dep)
+                prompt   = _build_prompt(dep, context)
+                data     = self._call_vertex(prompt)
             except Exception as exc:
-                msg = f"Failed to analyze {dep.name}: {exc}"
-                logger.error(msg)
-                result.warnings.append(msg)
+                logger.error("Vertex call failed for %s: %s: %s", dep.name, type(exc).__name__, exc)
+                data = self._fallback_response(dep)
+
+            breaking, warnings, summary, safe = self._parse_response(data, dep)
+            result.breaking_changes.extend(breaking)
+            result.warnings.extend(warnings)
+            summaries.append(f"[{dep.name} {dep.old_version}→{dep.new_version}] {summary}")
+            if not safe:
+                overall_safe = False
 
         result.summary       = "\n\n".join(summaries) or "Analysis complete."
         result.safe_to_merge = overall_safe and not result.has_critical
