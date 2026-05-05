@@ -42,10 +42,10 @@ class ChangeType(str, Enum):
 
 @dataclass
 class DependencyChange:
-    name: str
+    name:        str
     old_version: str
     new_version: str
-    file: str
+    file:        str
 
 
 @dataclass
@@ -78,7 +78,7 @@ class AnalysisResult:
 
 
 # ---------------------------------------------------------------------------
-# Pydantic schema — enforced on Gemini's output via response_schema
+# Pydantic schema — enforced on Gemini output via response_schema
 # ---------------------------------------------------------------------------
 
 class BreakingChangeSchema(BaseModel):
@@ -97,7 +97,7 @@ class AnalysisResponseSchema(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Diff parser  (pip · npm · Maven · Gradle · pyproject.toml)
+# Diff parser  (pip · npm · Maven · Gradle · pyproject.toml · libs.versions.toml)
 # ---------------------------------------------------------------------------
 
 _DEPENDENCY_PATTERNS = [
@@ -151,7 +151,8 @@ def parse_dependency_changes(diff: str) -> List[DependencyChange]:
         if line.startswith("diff --git") or line.startswith("--- ") or line.startswith("+++ "):
             _flush(current_file); removed.clear(); added.clear()
             if line.startswith("+++ "):
-                current_file = line[4:].strip().lstrip("b/")
+                path = line[4:].strip()
+                current_file = path.removeprefix("b/")    # fix for "uild.gradle" bug
         elif line.startswith("@@"):
             _flush(current_file); removed.clear(); added.clear()
         elif line.startswith("-") and not line.startswith("---"):
@@ -162,7 +163,7 @@ def parse_dependency_changes(diff: str) -> List[DependencyChange]:
     _flush(current_file)
 
     # Deduplicate
-    seen: set = set()
+    seen:   set                    = set()
     unique: List[DependencyChange] = []
     for c in changes:
         key = (c.name, c.old_version, c.new_version)
@@ -203,6 +204,17 @@ def _build_prompt(dep: DependencyChange, context: str) -> str:
     )
 
 
+def _build_short_prompt(dep: DependencyChange) -> str:
+    return (
+        f"Dependency : {dep.name}\n"
+        f"Old version: {dep.old_version}\n"
+        f"New version: {dep.new_version}\n\n"
+        "Based on your knowledge of this library's changelog, "
+        "analyze this version upgrade. "
+        "Focus only on the most impactful breaking changes — keep descriptions concise."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Vertex AI analyzer
 # ---------------------------------------------------------------------------
@@ -216,7 +228,7 @@ class DependencyAnalyzer:
         location: str = "us-central1",
         model_name: str = "gemini-1.5-pro",
         temperature: float = 0.1,
-        max_output_tokens: int = 4096,
+        max_output_tokens: int = 8192,
     ):
         self.project_id        = project_id
         self.location          = location
@@ -237,6 +249,14 @@ class DependencyAnalyzer:
             logger.info("Initialized Vertex AI model: %s", self.model_name)
         return self._model
 
+    def _generation_config(self) -> GenerationConfig:
+        return GenerationConfig(
+            temperature=self.temperature,
+            max_output_tokens=self.max_output_tokens,
+            response_mime_type="application/json",
+            response_schema=AnalysisResponseSchema,
+        )
+
     def _extract_diff_context(self, diff: str, dep: DependencyChange, context_lines: int = 20) -> str:
         lines = diff.splitlines()
         matches = [
@@ -248,21 +268,95 @@ class DependencyAnalyzer:
         c = matches[0]
         return "\n".join(lines[max(0, c - context_lines): c + context_lines])
 
-    def _call_vertex(self, prompt: str) -> AnalysisResponseSchema:
+    def _repair_json(self, raw: str) -> str:
         """
-        Call Gemini with response_schema so the output is guaranteed to be
-        valid JSON matching AnalysisResponseSchema — no string manipulation needed.
+        Best-effort repair of a truncated JSON string.
+        Strips the incomplete trailing field and closes all open brackets.
         """
-        model = self._init_model()
-        config = GenerationConfig(
-            temperature=self.temperature,
-            max_output_tokens=self.max_output_tokens,
-            response_mime_type="application/json",
-            response_schema=AnalysisResponseSchema,   # Gemini enforces this schema
+        logger.debug("Attempting JSON repair on: ...%s", raw[-200:])
+
+        raw = re.sub(r',?\s*"[^"]*":\s*"[^"]*$', '', raw)  # incomplete string value
+        raw = re.sub(r',?\s*"[^"]*":\s*$',        '', raw)  # key with no value
+        raw = re.sub(r',?\s*"[^"]*$',             '', raw)  # incomplete key
+        raw = raw.rstrip().rstrip(",")
+
+        # Close any open arrays and objects
+        open_brackets = raw.count("[") - raw.count("]")
+        open_braces   = raw.count("{") - raw.count("}")
+        raw += "]" * open_brackets
+        raw += "}" * open_braces
+
+        logger.debug("Repaired JSON tail: ...%s", raw[-200:])
+        return raw
+
+    def _safe_parse_response(self, raw: str, dep: DependencyChange) -> AnalysisResponseSchema:
+        """
+        Safely parse Gemini's response with repair fallback.
+        Handles truncation and malformed JSON without crashing.
+        """
+        raw = raw.strip()
+
+        if not raw or not raw.startswith("{"):
+            logger.warning("%s: Response empty or not JSON — falling back.", dep.name)
+            return self._fallback_response(dep)
+
+        if not raw.endswith("}"):
+            logger.warning("%s: Response appears truncated — attempting repair.", dep.name)
+            raw = self._repair_json(raw)
+
+        try:
+            return AnalysisResponseSchema.model_validate_json(raw)
+        except Exception as e:
+            logger.warning("%s: Initial parse failed (%s) — attempting repair.", dep.name, e)
+            try:
+                return AnalysisResponseSchema.model_validate_json(self._repair_json(raw))
+            except Exception as e2:
+                logger.error("%s: Repair also failed (%s) — falling back.", dep.name, e2)
+                return self._fallback_response(dep)
+
+    def _fallback_response(self, dep: DependencyChange) -> AnalysisResponseSchema:
+        """Conservative fallback when all parsing attempts fail."""
+        return AnalysisResponseSchema(
+            breaking_changes=[],
+            warnings=[f"Could not analyze {dep.name} — manual review recommended."],
+            summary=f"Analysis of {dep.name} {dep.old_version}→{dep.new_version} failed. Review manually.",
+            safe_to_merge=False,
         )
-        response = model.generate_content(prompt, generation_config=config)
-        logger.debug("Raw Vertex response: %s", response.text)
-        return AnalysisResponseSchema.model_validate_json(response.text)
+
+    def _call_vertex(self, prompt: str, dep: DependencyChange) -> AnalysisResponseSchema:
+        """Call Gemini with schema enforcement and truncation handling."""
+        model    = self._init_model()
+        response = model.generate_content(prompt, generation_config=self._generation_config())
+
+        logger.debug("%s: Raw response: %s", dep.name, response.text)
+
+        candidate     = response.candidates[0]
+        finish_reason = candidate.finish_reason.name
+        logger.debug("%s: finish_reason = %s", dep.name, finish_reason)
+
+        if finish_reason == "MAX_TOKENS":
+            logger.warning("%s: Hit MAX_TOKENS — retrying with short prompt.", dep.name)
+            return self._call_vertex_short(dep)
+
+        return self._safe_parse_response(response.text, dep)
+
+    def _call_vertex_short(self, dep: DependencyChange) -> AnalysisResponseSchema:
+        """Retry without diff context when full prompt exceeds token limit."""
+        logger.info("%s: Retrying with knowledge-only prompt.", dep.name)
+        model    = self._init_model()
+        response = model.generate_content(
+            _build_short_prompt(dep),
+            generation_config=self._generation_config(),
+        )
+
+        candidate     = response.candidates[0]
+        finish_reason = candidate.finish_reason.name
+
+        if finish_reason == "MAX_TOKENS":
+            logger.error("%s: Still truncated on short prompt — falling back.", dep.name)
+            return self._fallback_response(dep)
+
+        return self._safe_parse_response(response.text, dep)
 
     def _parse_response(
         self,
@@ -284,15 +378,6 @@ class DependencyAnalyzer:
         ]
         return breaking, data.warnings, data.summary, data.safe_to_merge
 
-    def _fallback_response(self, dep: DependencyChange) -> AnalysisResponseSchema:
-        """Conservative fallback when Vertex call fails entirely."""
-        return AnalysisResponseSchema(
-            breaking_changes=[],
-            warnings=[f"Could not analyze {dep.name} — manual review recommended."],
-            summary=f"Analysis of {dep.name} {dep.old_version}→{dep.new_version} failed. Review manually.",
-            safe_to_merge=False,
-        )
-
     # ── public ────────────────────────────────────────────────────────────
 
     def analyze_diff(self, diff: str) -> AnalysisResult:
@@ -305,17 +390,20 @@ class DependencyAnalyzer:
             return result
 
         logger.info("Found %d dependency change(s). Analyzing...", len(result.dependency_changes))
-        summaries: List[str] = []
-        overall_safe = True
+        summaries:    List[str] = []
+        overall_safe: bool      = True
 
         for dep in result.dependency_changes:
             logger.info("Analyzing: %s  %s → %s", dep.name, dep.old_version, dep.new_version)
             try:
-                context  = self._extract_diff_context(diff, dep)
-                prompt   = _build_prompt(dep, context)
-                data     = self._call_vertex(prompt)
+                context = self._extract_diff_context(diff, dep)
+                prompt  = _build_prompt(dep, context)
+                data    = self._call_vertex(prompt, dep)
             except Exception as exc:
-                logger.error("Vertex call failed for %s: %s: %s", dep.name, type(exc).__name__, exc)
+                logger.error(
+                    "Vertex call failed for %s: %s: %s",
+                    dep.name, type(exc).__name__, exc,
+                )
                 data = self._fallback_response(dep)
 
             breaking, warnings, summary, safe = self._parse_response(data, dep)
