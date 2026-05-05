@@ -1,0 +1,12 @@
+SAMPLE_DIFF = """\
+diff --git a/requirements.txt b/requirements.txt
+index abc1234..def5678 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,5 +1,5 @@
+-requests==2.28.0
++requests==2.31.2
+-pydantic==1.10.12
++pydantic==2.5.3
+ boto3==1.26.0
+"""
