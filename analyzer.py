@@ -254,7 +254,29 @@ class DependencyAnalyzer:
             temperature=self.temperature,
             max_output_tokens=self.max_output_tokens,
             response_mime_type="application/json",
-            response_schema=AnalysisResponseSchema,
+            response_schema={
+                "type": "object",
+                "properties": {
+                    "breaking_changes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "change_type":    {"type": "string", "enum": [e.value for e in ChangeType]},
+                                "description":    {"type": "string"},
+                                "severity":       {"type": "string", "enum": [e.value for e in Severity]},
+                                "affected_code":  {"type": "string"},
+                                "migration_hint": {"type": "string"},
+                            },
+                            "required": ["change_type", "description", "severity"],
+                        },
+                    },
+                    "warnings":      {"type": "array", "items": {"type": "string"}},
+                    "summary":       {"type": "string"},
+                    "safe_to_merge": {"type": "boolean"},
+                },
+                "required": ["breaking_changes", "warnings", "summary", "safe_to_merge"],
+            },
         )
 
     def _extract_diff_context(self, diff: str, dep: DependencyChange, context_lines: int = 20) -> str:
