@@ -1,5 +1,6 @@
 """
-Dependency Version Change Analyzer using Vertex AI (Gemini)
+analyzer.py
+Dependency Version Change Analyzer using Vertex AI (Gemini).
 Analyzes PR diffs to detect breaking changes between dependency versions.
 """
 
@@ -14,6 +15,8 @@ from typing import List, Optional, Tuple
 from pydantic import BaseModel, Field
 import vertexai
 from vertexai.generative_models import GenerativeModel, GenerationConfig
+
+from credentials import RefreshableCredentials, get_token
 
 logger = logging.getLogger(__name__)
 
@@ -82,22 +85,26 @@ class AnalysisResult:
 # ---------------------------------------------------------------------------
 
 class BreakingChangeSchema(BaseModel):
-    change_type:    ChangeType
+    model_config = {"populate_by_name": True}
+
+    change_type:    ChangeType      = Field(alias="changeType",    default=ChangeType.OTHER)
     description:    str
     severity:       Severity
-    affected_code:  Optional[str] = None
-    migration_hint: Optional[str] = None
+    affected_code:  Optional[str]  = Field(alias="affectedCode",  default=None)
+    migration_hint: Optional[str]  = Field(alias="migrationHint", default=None)
 
 
 class AnalysisResponseSchema(BaseModel):
-    breaking_changes: List[BreakingChangeSchema] = Field(default_factory=list)
+    model_config = {"populate_by_name": True}
+
+    breaking_changes: List[BreakingChangeSchema] = Field(alias="breakingChanges", default_factory=list)
     warnings:         List[str]                  = Field(default_factory=list)
-    summary:          str
-    safe_to_merge:    bool
+    summary:          str                        = ""
+    safe_to_merge:    bool                       = Field(alias="safeToMerge", default=False)
 
 
 # ---------------------------------------------------------------------------
-# Diff parser  (pip · npm · Maven · Gradle · pyproject.toml · libs.versions.toml)
+# Diff parser — pip · npm · Maven · Gradle · pyproject.toml · libs.versions.toml
 # ---------------------------------------------------------------------------
 
 _DEPENDENCY_PATTERNS = [
@@ -152,7 +159,7 @@ def parse_dependency_changes(diff: str) -> List[DependencyChange]:
             _flush(current_file); removed.clear(); added.clear()
             if line.startswith("+++ "):
                 path = line[4:].strip()
-                current_file = path.removeprefix("b/")    # fix for "uild.gradle" bug
+                current_file = path.removeprefix("b/")   # fix: avoid "uild.gradle"
         elif line.startswith("@@"):
             _flush(current_file); removed.clear(); added.clear()
         elif line.startswith("-") and not line.startswith("---"):
@@ -229,24 +236,44 @@ class DependencyAnalyzer:
         model_name: str = "gemini-1.5-pro",
         temperature: float = 0.1,
         max_output_tokens: int = 8192,
+        api_endpoint: str = "",
+        token_expiry_seconds: int = 3600,
     ):
-        self.project_id        = project_id
-        self.location          = location
-        self.model_name        = model_name
-        self.temperature       = temperature
-        self.max_output_tokens = max_output_tokens
+        self.project_id          = project_id
+        self.location            = location
+        self.model_name          = model_name
+        self.temperature         = temperature
+        self.max_output_tokens   = max_output_tokens
+        self.api_endpoint        = api_endpoint
+        self.token_expiry_seconds = token_expiry_seconds
         self._model: Optional[GenerativeModel] = None
 
     # ── private ───────────────────────────────────────────────────────────
 
     def _init_model(self) -> GenerativeModel:
+        """
+        Reinitialises vertexai on every call with fresh RefreshableCredentials.
+        google-auth calls refresh() automatically when the token expires —
+        no manual token tracking needed.
+        """
+        credentials = RefreshableCredentials(
+            token_fetcher=get_token,
+            expiry_seconds=self.token_expiry_seconds,
+        )
+        vertexai.init(
+            project=self.project_id,
+            api_transport="rest",
+            api_endpoint=self.api_endpoint,
+            credentials=credentials,
+        )
+
         if self._model is None:
-            vertexai.init(project=self.project_id, location=self.location)
             self._model = GenerativeModel(
                 model_name=self.model_name,
                 system_instruction=_SYSTEM_PROMPT,
             )
             logger.info("Initialized Vertex AI model: %s", self.model_name)
+
         return self._model
 
     def _generation_config(self) -> GenerationConfig:
@@ -291,49 +318,44 @@ class DependencyAnalyzer:
         return "\n".join(lines[max(0, c - context_lines): c + context_lines])
 
     def _repair_json(self, raw: str) -> str:
-        """
-        Best-effort repair of a truncated JSON string.
-        Strips the incomplete trailing field and closes all open brackets.
-        """
-        logger.debug("Attempting JSON repair on: ...%s", raw[-200:])
-
+        """Best-effort repair of a truncated JSON string from Gemini."""
+        logger.debug("Attempting JSON repair on tail: ...%s", raw[-200:])
         raw = re.sub(r',?\s*"[^"]*":\s*"[^"]*$', '', raw)  # incomplete string value
         raw = re.sub(r',?\s*"[^"]*":\s*$',        '', raw)  # key with no value
         raw = re.sub(r',?\s*"[^"]*$',             '', raw)  # incomplete key
         raw = raw.rstrip().rstrip(",")
-
-        # Close any open arrays and objects
-        open_brackets = raw.count("[") - raw.count("]")
-        open_braces   = raw.count("{") - raw.count("}")
-        raw += "]" * open_brackets
-        raw += "}" * open_braces
-
+        raw += "]" * (raw.count("[") - raw.count("]"))
+        raw += "}" * (raw.count("{") - raw.count("}"))
         logger.debug("Repaired JSON tail: ...%s", raw[-200:])
         return raw
 
     def _safe_parse_response(self, raw: str, dep: DependencyChange) -> AnalysisResponseSchema:
-        """
-        Safely parse Gemini's response with repair fallback.
-        Handles truncation and malformed JSON without crashing.
-        """
-        raw = raw.strip()
+        """Safely parse Gemini's response with repair fallback."""
+        raw = raw.strip() if raw else ""
+
+        logger.info("%s: raw length=%d  preview=%r", dep.name, len(raw), raw[:300])
 
         if not raw or not raw.startswith("{"):
             logger.warning("%s: Response empty or not JSON — falling back.", dep.name)
             return self._fallback_response(dep)
 
         if not raw.endswith("}"):
-            logger.warning("%s: Response appears truncated — attempting repair.", dep.name)
+            logger.warning("%s: Response truncated — attempting repair.", dep.name)
             raw = self._repair_json(raw)
 
         try:
-            return AnalysisResponseSchema.model_validate_json(raw)
+            result = AnalysisResponseSchema.model_validate_json(raw)
+            logger.info("%s: Parsed OK — summary=%r", dep.name, result.summary[:80])
+            return result
         except Exception as e:
-            logger.warning("%s: Initial parse failed (%s) — attempting repair.", dep.name, e)
+            logger.warning("%s: Parse failed (%s) — attempting repair.", dep.name, e)
+            logger.debug("%s: Full raw =\n%s", dep.name, raw)
             try:
-                return AnalysisResponseSchema.model_validate_json(self._repair_json(raw))
+                result = AnalysisResponseSchema.model_validate_json(self._repair_json(raw))
+                logger.info("%s: Repair succeeded.", dep.name)
+                return result
             except Exception as e2:
-                logger.error("%s: Repair also failed (%s) — falling back.", dep.name, e2)
+                logger.error("%s: Repair failed (%s) — falling back.", dep.name, e2)
                 return self._fallback_response(dep)
 
     def _fallback_response(self, dep: DependencyChange) -> AnalysisResponseSchema:
@@ -350,11 +372,9 @@ class DependencyAnalyzer:
         model    = self._init_model()
         response = model.generate_content(prompt, generation_config=self._generation_config())
 
-        logger.debug("%s: Raw response: %s", dep.name, response.text)
-
         candidate     = response.candidates[0]
         finish_reason = candidate.finish_reason.name
-        logger.debug("%s: finish_reason = %s", dep.name, finish_reason)
+        logger.info("%s: finish_reason=%s", dep.name, finish_reason)
 
         if finish_reason == "MAX_TOKENS":
             logger.warning("%s: Hit MAX_TOKENS — retrying with short prompt.", dep.name)
@@ -422,10 +442,7 @@ class DependencyAnalyzer:
                 prompt  = _build_prompt(dep, context)
                 data    = self._call_vertex(prompt, dep)
             except Exception as exc:
-                logger.error(
-                    "Vertex call failed for %s: %s: %s",
-                    dep.name, type(exc).__name__, exc,
-                )
+                logger.error("Vertex call failed for %s: %s: %s", dep.name, type(exc).__name__, exc)
                 data = self._fallback_response(dep)
 
             breaking, warnings, summary, safe = self._parse_response(data, dep)
