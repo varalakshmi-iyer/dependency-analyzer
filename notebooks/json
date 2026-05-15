@@ -1,0 +1,73 @@
+import urllib.request
+
+GEMINI_API_KEY = "your-key-here"   # ← paste your key
+
+PROMPT_TEMPLATE = """You are analysing legacy source code for a modernisation project.
+
+File: {path}
+Language: {language}
+Code (sanitised):
+{code}
+
+Identified code units:
+{units}
+
+For each unit return JSON:
+{{
+  "annotations": [
+    {{
+      "name": "<unit name>",
+      "description": "<1 sentence plain English>",
+      "is_entry_point": true/false,
+      "ghost_rule_risk": true/false,
+      "ghost_rule_reason": "<reason or null>"
+    }}
+  ],
+  "module_summary": "<2 sentences on what this file does>",
+  "business_domain": "<e.g. payment processing, account management>"
+}}
+
+Respond ONLY with valid JSON."""
+
+def annotate_with_gemini(path, language, code, nodes):
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "your-key-here":
+        print("⚠️  No API key — skipping LLM annotation")
+        return None
+
+    units = "\n".join(f"- {n['name']} ({n['type']}) line {n['line']}" for n in nodes[:20])
+    prompt = PROMPT_TEMPLATE.format(
+        path=path, language=language,
+        code=code[:4000], units=units
+    )
+
+    payload = json.dumps({
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 2048}
+    }).encode()
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read())
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text.strip())
+        text = re.sub(r"\n?```\s*$", "", text)
+        return json.loads(text)
+
+# Run on first Python file found
+py_files = [f for f in files if f.endswith(".py")]
+if py_files:
+    target  = py_files[0]
+    content = open(os.path.join(CLONE_DIR, target), errors="replace").read()
+    result  = parse_file(target, content)
+    print(f"Annotating: {target}  ({len(result['nodes'])} nodes)")
+    annotation = annotate_with_gemini(target, result["language"], content, result["nodes"])
+    if annotation:
+        print(f"\n📋 Module summary: {annotation.get('module_summary')}")
+        print(f"🏦 Business domain: {annotation.get('business_domain')}")
+        print(f"\n🔍 Node annotations:")
+        for a in annotation.get("annotations", []):
+            ghost = "  ⚑ GHOST RISK: " + a["ghost_rule_reason"] if a.get("ghost_rule_risk") else ""
+            entry = "  ★ ENTRY" if a.get("is_entry_point") else ""
+            print(f"  {a['name']:<30} {a['description'][:60]}{entry}{ghost}")
