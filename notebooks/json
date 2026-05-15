@@ -27,47 +27,85 @@ For each unit return JSON:
   "business_domain": "<e.g. payment processing, account management>"
 }}
 
-Respond ONLY with valid JSON."""
+Respond ONLY with valid JSON. No markdown fences."""
 
-def annotate_with_gemini(path, language, code, nodes):
-    if not GEMINI_API_KEY or GEMINI_API_KEY == "your-key-here":
-        print("⚠️  No API key — skipping LLM annotation")
+
+# ── Annotation function ───────────────────────────────────────────
+
+def annotate_with_vertex(path, language, code, nodes):
+    if not nodes:
+        print("  ⚠️  No nodes to annotate")
         return None
 
-    units = "\n".join(f"- {n['name']} ({n['type']}) line {n['line']}" for n in nodes[:20])
+    units = "\n".join(
+        f"- {n['name']} ({n['type']}) line {n['line']}"
+        for n in nodes[:20]
+    )
     prompt = PROMPT_TEMPLATE.format(
         path=path, language=language,
-        code=code[:4000], units=units
+        code=code[:4000],
+        units=units,
     )
 
-    payload = json.dumps({
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 2048}
-    }).encode()
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read())
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        text = re.sub(r"^```(?:json)?\s*\n?", "", text.strip())
+    try:
+        response = model.generate_content(prompt, generation_config=gen_config)
+        text = response.text.strip()
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
         text = re.sub(r"\n?```\s*$", "", text)
         return json.loads(text)
+    except Exception as e:
+        print(f"  ❌ Vertex AI error: {e}")
+        return None
 
-# Run on first Python file found
-py_files = [f for f in files if f.endswith(".py")]
-if py_files:
-    target  = py_files[0]
-    content = open(os.path.join(CLONE_DIR, target), errors="replace").read()
-    result  = parse_file(target, content)
-    print(f"Annotating: {target}  ({len(result['nodes'])} nodes)")
-    annotation = annotate_with_gemini(target, result["language"], content, result["nodes"])
+
+# ── Run across all file types ─────────────────────────────────────
+
+TARGET_EXTS = {".py", ".java", ".js", ".ts", ".cbl", ".cob",
+               ".rpgle", ".sql", ".go", ".cs"}
+
+MAX_FILES_TO_ANNOTATE = 10
+
+results = []
+
+for rel_path in files[:MAX_FILES_TO_ANNOTATE]:
+    ext = os.path.splitext(rel_path)[1].lower()
+    if ext not in TARGET_EXTS:
+        continue
+
+    full = os.path.join(CLONE_DIR, rel_path)
+    try:
+        content = open(full, encoding="utf-8", errors="replace").read()
+    except OSError:
+        continue
+
+    result = parse_file(rel_path, content)
+
+    if not result["nodes"]:
+        print(f"⏭  {rel_path}  — no nodes found, skipping")
+        continue
+
+    print(f"\n{'─'*70}")
+    print(f"📄 {rel_path}  [{result['language']}]  nodes={len(result['nodes'])}")
+
+    annotation = annotate_with_vertex(
+        rel_path, result["language"], content, result["nodes"]
+    )
+
     if annotation:
-        print(f"\n📋 Module summary: {annotation.get('module_summary')}")
-        print(f"🏦 Business domain: {annotation.get('business_domain')}")
-        print(f"\n🔍 Node annotations:")
+        result["annotation"] = annotation
+        print(f"   📋 {annotation.get('module_summary', '')[:120]}")
+        print(f"   🏦 {annotation.get('business_domain', '')}")
+        print(f"\n   {'NAME':<30} {'ENTRY':<7} {'GHOST?':<7} DESCRIPTION")
+        print(f"   {'─'*80}")
         for a in annotation.get("annotations", []):
-            ghost = "  ⚑ GHOST RISK: " + a["ghost_rule_reason"] if a.get("ghost_rule_risk") else ""
-            entry = "  ★ ENTRY" if a.get("is_entry_point") else ""
-            print(f"  {a['name']:<30} {a['description'][:60]}{entry}{ghost}")
+            entry  = "★" if a.get("is_entry_point") else ""
+            ghost  = "⚑" if a.get("ghost_rule_risk") else ""
+            desc   = a.get("description", "")[:50]
+            reason = f" → {a['ghost_rule_reason']}" if a.get("ghost_rule_reason") else ""
+            print(f"   {a['name']:<30} {entry:<7} {ghost:<7} {desc}{reason}")
+    else:
+        print(f"   ⚠️  Annotation failed")
+
+    results.append(result)
+
+print(f"\n✅ Done — annotated {len(results)} files")
