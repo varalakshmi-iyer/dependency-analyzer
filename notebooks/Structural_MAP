@@ -1,0 +1,72 @@
+# Run the full pipeline on the cloned repo and emit a JSON artifact
+
+def build_structural_map(repo_url, clone_dir, files, max_files=20):
+    artifact = {
+        "artifact_id":    str(hashlib.md5(repo_url.encode()).hexdigest()[:12]),
+        "repo_url":       repo_url,
+        "created_at":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "total_files":    len(files),
+        "parsed_files":   0,
+        "all_nodes":      [],
+        "dependencies":   [],
+        "ghost_rule_candidates": [],
+        "entry_points":   [],
+        "language_summary": {},
+        "guardrail_findings": [],
+    }
+
+    for rel_path in files[:max_files]:
+        full = os.path.join(clone_dir, rel_path)
+        try:
+            content = open(full, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+
+        result = parse_file(rel_path, content)
+        lang   = result["language"]
+        nodes  = result["nodes"]
+
+        # Aggregate
+        artifact["parsed_files"] += 1
+        artifact["guardrail_findings"].extend(result["guardrail_findings"])
+
+        lang_stats = artifact["language_summary"].setdefault(lang, {"files": 0, "nodes": 0, "lines": 0})
+        lang_stats["files"] += 1
+        lang_stats["nodes"] += len(nodes)
+        lang_stats["lines"] += result["lines"]
+
+        for n in nodes:
+            n["file"] = rel_path
+            artifact["all_nodes"].append(n)
+            if n.get("is_entry"):       artifact["entry_points"].append(n["name"])
+            if n.get("ghost_risk"):     artifact["ghost_rule_candidates"].append({"file": rel_path, **n})
+            if n["type"] == "call_dep": artifact["dependencies"].append({"from": rel_path, "to": n["name"]})
+
+    # SHA-256 fingerprint
+    payload = json.dumps(artifact, sort_keys=True, default=str)
+    artifact["sha256"] = hashlib.sha256(payload.encode()).hexdigest()
+    return artifact
+
+# Run it
+artifact = build_structural_map(REPO_URL, CLONE_DIR, files)
+
+# Print summary
+print("=" * 60)
+print("ARTIFACT ①  — JSON Structural Map")
+print("=" * 60)
+print(f"  artifact_id  : {artifact['artifact_id']}")
+print(f"  sha256       : {artifact['sha256'][:32]}...")
+print(f"  files parsed : {artifact['parsed_files']} / {artifact['total_files']}")
+print(f"  total nodes  : {len(artifact['all_nodes'])}")
+print(f"  entry points : {artifact['entry_points'][:5]}")
+print(f"  ghost risks  : {len(artifact['ghost_rule_candidates'])}")
+print(f"  dependencies : {len(artifact['dependencies'])}")
+print(f"\n  Language breakdown:")
+for lang, stats in sorted(artifact['language_summary'].items()):
+    print(f"    {lang:<15} {stats['files']} files  {stats['nodes']} nodes  {stats['lines']} lines")
+
+# Save it
+out = "/tmp/structural_map.json"
+with open(out, "w") as f:
+    json.dump(artifact, f, indent=2, default=str)
+print(f"\n✅ Artifact written to {out}")
