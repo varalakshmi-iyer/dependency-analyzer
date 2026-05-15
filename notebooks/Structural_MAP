@@ -1,19 +1,43 @@
-# Run the full pipeline on the cloned repo and emit a JSON artifact
-
-def build_structural_map(repo_url, clone_dir, files, max_files=20):
+def build_structural_map(repo_url, clone_dir, files, annotated_results, max_files=20):
     artifact = {
-        "artifact_id":    str(hashlib.md5(repo_url.encode()).hexdigest()[:12]),
-        "repo_url":       repo_url,
-        "created_at":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "total_files":    len(files),
-        "parsed_files":   0,
-        "all_nodes":      [],
-        "dependencies":   [],
+        "artifact_id":           hashlib.md5(repo_url.encode()).hexdigest()[:12],
+        "repo_url":              repo_url,
+        "created_at":            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "total_files":           len(files),
+        "parsed_files":          0,
+        "all_nodes":             [],
+        "dependencies":          [],
         "ghost_rule_candidates": [],
-        "entry_points":   [],
-        "language_summary": {},
-        "guardrail_findings": [],
+        "entry_points":          [],
+        "language_summary":      {},
+        "guardrail_findings":    [],
+        "module_summaries":      {},   # ← new: LLM summary per file
+        "business_domains":      {},   # ← new: LLM domain per file
     }
+
+    # Build a lookup from file path → annotation
+    # so we can merge Cell 5 results into the artifact
+    annotation_lookup = {}
+    for r in annotated_results:
+        if "annotation" in r:
+            annotation_lookup[r["language"]] = r  # temp — fix below
+
+    # Better lookup — key by file path
+    annotation_by_file = {}
+    for r in annotated_results:
+        if "annotation" in r:
+            # find which file this result belongs to
+            for rel_path in files:
+                full = os.path.join(clone_dir, rel_path)
+                try:
+                    content = open(full, encoding="utf-8", errors="replace").read()
+                    test    = parse_file(rel_path, content)
+                    if (test["language"] == r["language"] and
+                            test["lines"] == r["lines"]):
+                        annotation_by_file[rel_path] = r["annotation"]
+                        break
+                except Exception:
+                    continue
 
     for rel_path in files[:max_files]:
         full = os.path.join(clone_dir, rel_path)
@@ -26,31 +50,62 @@ def build_structural_map(repo_url, clone_dir, files, max_files=20):
         lang   = result["language"]
         nodes  = result["nodes"]
 
-        # Aggregate
         artifact["parsed_files"] += 1
         artifact["guardrail_findings"].extend(result["guardrail_findings"])
 
-        lang_stats = artifact["language_summary"].setdefault(lang, {"files": 0, "nodes": 0, "lines": 0})
-        lang_stats["files"] += 1
-        lang_stats["nodes"] += len(nodes)
-        lang_stats["lines"] += result["lines"]
+        s = artifact["language_summary"].setdefault(
+            lang, {"files": 0, "nodes": 0, "lines": 0}
+        )
+        s["files"] += 1
+        s["nodes"] += len(nodes)
+        s["lines"] += result["lines"]
+
+        # Pull annotation for this file if it exists
+        annotation = annotation_by_file.get(rel_path, {})
+
+        # Build annotation lookup by node name for merging
+        ann_by_name = {}
+        if annotation:
+            for a in annotation.get("annotations", []):
+                ann_by_name[a["name"]] = a
+
+            # Store file-level LLM outputs
+            artifact["module_summaries"][rel_path] = annotation.get("module_summary", "")
+            artifact["business_domains"][rel_path] = annotation.get("business_domain", "")
 
         for n in nodes:
             n["file"] = rel_path
-            artifact["all_nodes"].append(n)
-            if n.get("is_entry"):       artifact["entry_points"].append(n["name"])
-            if n.get("ghost_risk"):     artifact["ghost_rule_candidates"].append({"file": rel_path, **n})
-            if n["type"] == "call_dep": artifact["dependencies"].append({"from": rel_path, "to": n["name"]})
 
-    # SHA-256 fingerprint
-    payload = json.dumps(artifact, sort_keys=True, default=str)
+            # Merge LLM annotation into the node
+            ann = ann_by_name.get(n["name"], {})
+            if ann:
+                n["description"]      = ann.get("description", "")
+                n["is_entry"]         = n.get("is_entry") or ann.get("is_entry_point", False)
+                n["ghost_risk"]       = ann.get("ghost_rule_risk", n.get("ghost_risk", False))
+                n["ghost_risk_reason"]= ann.get("ghost_rule_reason", "")
+            else:
+                n["description"]      = ""
+                n["ghost_risk_reason"]= ""
+
+            artifact["all_nodes"].append(n)
+
+            if n.get("is_entry"):   artifact["entry_points"].append(n["name"])
+            if n.get("ghost_risk"): artifact["ghost_rule_candidates"].append({
+                "file":   rel_path,
+                "reason": n.get("ghost_risk_reason", ""),
+                **n
+            })
+            if n.get("type") in ("call_dep", "import"):
+                artifact["dependencies"].append({"from": rel_path, "to": n["name"]})
+
+    payload            = json.dumps(artifact, sort_keys=True, default=str)
     artifact["sha256"] = hashlib.sha256(payload.encode()).hexdigest()
     return artifact
 
-# Run it
-artifact = build_structural_map(REPO_URL, CLONE_DIR, files)
 
-# Print summary
+# ── Pass annotated results from Cell 5 ────────────────────────────
+artifact = build_structural_map(REPO_URL, CLONE_DIR, files, results)
+
 print("=" * 60)
 print("ARTIFACT ①  — JSON Structural Map")
 print("=" * 60)
@@ -61,12 +116,26 @@ print(f"  total nodes  : {len(artifact['all_nodes'])}")
 print(f"  entry points : {artifact['entry_points'][:5]}")
 print(f"  ghost risks  : {len(artifact['ghost_rule_candidates'])}")
 print(f"  dependencies : {len(artifact['dependencies'])}")
-print(f"\n  Language breakdown:")
-for lang, stats in sorted(artifact['language_summary'].items()):
-    print(f"    {lang:<15} {stats['files']} files  {stats['nodes']} nodes  {stats['lines']} lines")
 
-# Save it
-out = "/tmp/structural_map.json"
-with open(out, "w") as f:
+print(f"\n  Language breakdown:")
+for lang, stats in sorted(artifact["language_summary"].items()):
+    print(f"    {lang:<15} {stats['files']} files   {stats['nodes']} nodes   {stats['lines']} lines")
+
+print(f"\n  Module summaries (LLM):")
+for path, summary in list(artifact["module_summaries"].items())[:5]:
+    print(f"    {path}")
+    print(f"      📋 {summary[:100]}")
+    print(f"      🏦 {artifact['business_domains'].get(path,'')}")
+
+print(f"\n  Ghost rule candidates:")
+for g in artifact["ghost_rule_candidates"][:5]:
+    print(f"    {g['file']}  →  {g['name']}  :  {g.get('reason','')[:80]}")
+
+print(f"\n  Sample nodes with descriptions:")
+annotated_nodes = [n for n in artifact["all_nodes"] if n.get("description")]
+for n in annotated_nodes[:8]:
+    print(f"    [{n['type']:<10}] {n['name']:<30} {n['description'][:60]}")
+
+with open("/tmp/structural_map.json", "w") as f:
     json.dump(artifact, f, indent=2, default=str)
-print(f"\n✅ Artifact written to {out}")
+print(f"\n✅ Artifact saved to /tmp/structural_map.json")
