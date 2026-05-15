@@ -1,0 +1,29 @@
+# Pick any Java file and inspect what's happening step by step
+
+import os
+
+java_files = [f for f in files if f.endswith(".java")]
+print(f"Total Java files: {len(java_files)}")
+print("First 5:", java_files[:5])
+
+# Pick one file and print the raw content
+target = java_files[0]
+full   = os.path.join(CLONE_DIR, target)
+content = open(full, encoding="utf-8", errors="replace").read()
+
+print(f"File: {target}")
+print(f"Lines: {content.count(chr(10))}")
+print("\n--- First 50 lines ---")
+for i, line in enumerate(content.split("\n")[:50], 1):
+    print(f"{i:>3}  {line}")
+
+# Check what detect() returns for this file
+lang, strategy = detect(target)
+print(f"Detected language : {lang}")
+print(f"Strategy          : {strategy}")
+
+# Run parse_java directly and see what it finds
+result = parse_java(target, content)
+print(f"Nodes found: {len(result['nodes'])}")
+for n in result["nodes"]:
+    print(f"  line {n['line']:>4}  [{n['type']:<10}]  {n['name']}")
