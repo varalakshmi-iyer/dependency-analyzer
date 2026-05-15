@@ -1,29 +1,183 @@
-# Pick any Java file and inspect what's happening step by step
+# ── Language map ──────────────────────────────────────────────────
+LANG_MAP = {
+    ".py":    ("python",     "python_ast"),
+    ".java":  ("java",       "java_regex"),
+    ".js":    ("javascript", "generic_line"),
+    ".ts":    ("typescript", "generic_line"),
+    ".cbl":   ("cobol",      "antlr_regex"),
+    ".cob":   ("cobol",      "antlr_regex"),
+    ".rpgle": ("rpgle",      "antlr_regex"),
+    ".pli":   ("pli",        "generic_line"),
+    ".sql":   ("sql",        "generic_line"),
+    ".sh":    ("bash",       "generic_line"),
+    ".go":    ("go",         "generic_line"),
+}
 
-import os
+def detect(path):
+    ext = os.path.splitext(path)[1].lower()
+    return LANG_MAP.get(ext, ("unknown", "generic_line"))
 
-java_files = [f for f in files if f.endswith(".java")]
-print(f"Total Java files: {len(java_files)}")
-print("First 5:", java_files[:5])
 
-# Pick one file and print the raw content
-target = java_files[0]
-full   = os.path.join(CLONE_DIR, target)
-content = open(full, encoding="utf-8", errors="replace").read()
+# ── Python parser ─────────────────────────────────────────────────
+def parse_python(path, content):
+    nodes, deps = [], []
+    try:
+        tree = ast.parse(content)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                branches = sum(1 for n in ast.walk(node)
+                               if isinstance(n, (ast.If, ast.For, ast.While, ast.ExceptHandler)))
+                nodes.append({
+                    "type":       "function",
+                    "name":       node.name,
+                    "line":       node.lineno,
+                    "params":     [a.arg for a in node.args.args],
+                    "complexity": 1 + branches,
+                    "is_entry":   node.name in ("main", "handler", "lambda_handler"),
+                    "ghost_risk": False,
+                })
+            elif isinstance(node, ast.ClassDef):
+                nodes.append({
+                    "type": "class", "name": node.name,
+                    "line": node.lineno, "ghost_risk": False,
+                })
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    deps.append({"type": "import", "name": alias.name})
+            elif isinstance(node, ast.ImportFrom):
+                deps.append({"type": "from_import", "name": node.module or ""})
+    except SyntaxError as e:
+        return {"nodes": [], "dependencies": [], "error": str(e), "annotations": []}
+    return {"nodes": nodes, "dependencies": deps, "annotations": []}
 
-print(f"File: {target}")
-print(f"Lines: {content.count(chr(10))}")
-print("\n--- First 50 lines ---")
-for i, line in enumerate(content.split("\n")[:50], 1):
-    print(f"{i:>3}  {line}")
 
-# Check what detect() returns for this file
-lang, strategy = detect(target)
-print(f"Detected language : {lang}")
-print(f"Strategy          : {strategy}")
+# ── Java parser ───────────────────────────────────────────────────
+JAVA_CLASS_PATTERN = re.compile(
+    r"^\s*(?:public|private|protected|abstract|final)?\s*"
+    r"(?:class|interface|enum|record)\s+(\w+)",
+    re.MULTILINE
+)
+JAVA_METHOD_PATTERN = re.compile(
+    r"^\s*(?:(?:public|private|protected|static|final|abstract|synchronized|native)\s+)*"
+    r"(?!if|while|for|switch|return|new)(?:[\w<>\[\]]+)\s+(\w+)\s*\(",
+    re.MULTILINE
+)
+JAVA_IMPORT_PATTERN     = re.compile(r"^\s*import\s+([\w.]+);", re.MULTILINE)
+JAVA_ANNOTATION_PATTERN = re.compile(
+    r"@(RestController|Service|Repository|Component|SpringBootApplication|Bean)"
+)
 
-# Run parse_java directly and see what it finds
-result = parse_java(target, content)
-print(f"Nodes found: {len(result['nodes'])}")
-for n in result["nodes"]:
-    print(f"  line {n['line']:>4}  [{n['type']:<10}]  {n['name']}")
+def parse_java(path, content):
+    nodes = []
+    for m in JAVA_CLASS_PATTERN.finditer(content):
+        line = content[:m.start()].count("\n") + 1
+        nodes.append({"type": "class", "name": m.group(1),
+                      "line": line, "ghost_risk": False})
+
+    for m in JAVA_METHOD_PATTERN.finditer(content):
+        name = m.group(1)
+        if name in ("if","while","for","switch","catch","return","new","else"):
+            continue
+        line        = content[:m.start()].count("\n") + 1
+        snippet     = content[m.start():m.start() + 500]
+        branches    = len(re.findall(r"\b(if|for|while|catch|case|&&|\|\|)\b", snippet))
+        surrounding = content[max(0, m.start()-100):m.start()]
+        is_entry    = bool(re.search(
+            r"@(GetMapping|PostMapping|PutMapping|DeleteMapping|RequestMapping|EventListener|Scheduled)",
+            surrounding
+        ))
+        nodes.append({
+            "type":       "method",
+            "name":       name,
+            "line":       line,
+            "complexity": 1 + branches,
+            "is_entry":   is_entry,
+            "ghost_risk": False,
+        })
+
+    deps = [
+        {"type": "import", "name": m.group(1)}
+        for m in JAVA_IMPORT_PATTERN.finditer(content)
+    ]
+    return {
+        "nodes":        nodes,
+        "dependencies": deps,
+        "annotations":  JAVA_ANNOTATION_PATTERN.findall(content),
+    }
+
+
+# ── COBOL parser ──────────────────────────────────────────────────
+def parse_cobol(path, content):
+    nodes, deps = [], []
+    in_proc_div  = False
+    for i, line in enumerate(content.split("\n"), 1):
+        if len(line) > 6 and line[6:7] == "*":
+            continue
+        if "PROCEDURE DIVISION" in line.upper():
+            in_proc_div = True
+        m = re.search(r"PROGRAM-ID\.\s+(\S+)", line, re.IGNORECASE)
+        if m:
+            nodes.append({"type": "program", "name": m.group(1).rstrip("."),
+                          "line": i, "is_entry": True, "ghost_risk": False})
+        m = re.search(r"^([A-Z0-9][A-Z0-9\-]*)\s+SECTION\.", line, re.IGNORECASE)
+        if m:
+            nodes.append({"type": "section", "name": m.group(1),
+                          "line": i, "ghost_risk": in_proc_div})
+        m = re.search(r"CALL\s+['\"]?([A-Z0-9\-]+)['\"]?", line, re.IGNORECASE)
+        if m:
+            deps.append({"type": "call", "name": m.group(1)})
+        m = re.search(r"COPY\s+([A-Z0-9\-]+)", line, re.IGNORECASE)
+        if m:
+            deps.append({"type": "copy", "name": m.group(1)})
+    return {"nodes": nodes, "dependencies": deps, "annotations": []}
+
+
+# ── Generic fallback parser ───────────────────────────────────────
+def parse_generic(path, content, lang):
+    nodes = []
+    pattern = re.compile(
+        r"^\s*(?:def|function|func|sub|proc|DCL-PROC|BEGSR)\s+(\w+)\s*[\(;]?",
+        re.IGNORECASE
+    )
+    for i, line in enumerate(content.split("\n"), 1):
+        m = pattern.match(line)
+        if m:
+            nodes.append({"type": "function", "name": m.group(1),
+                          "line": i, "ghost_risk": False})
+    return {"nodes": nodes, "dependencies": [], "annotations": []}
+
+
+# ── Router ────────────────────────────────────────────────────────
+def parse_file(path, content):
+    lang, strategy = detect(path)
+    sanitised, findings = scan_and_sanitise(content)
+
+    if lang == "python":
+        result = parse_python(path, sanitised)
+    elif lang == "java":
+        result = parse_java(path, sanitised)
+    elif lang == "cobol":
+        result = parse_cobol(path, sanitised)
+    else:
+        result = parse_generic(path, sanitised, lang)
+
+    result.update({
+        "language":           lang,
+        "strategy":           strategy,
+        "guardrail_findings": findings,
+        "lines":              content.count("\n") + 1,
+    })
+    return result
+
+
+# ── Sanity check ──────────────────────────────────────────────────
+print(f"{'FILE':<55} {'LANG':<12} {'NODES'}")
+print("─" * 75)
+for rel_path in files[:20]:
+    full = os.path.join(CLONE_DIR, rel_path)
+    try:
+        content = open(full, encoding="utf-8", errors="replace").read()
+        result  = parse_file(rel_path, content)
+        print(f"{rel_path:<55} {result['language']:<12} {len(result['nodes'])}")
+    except Exception as e:
+        print(f"{rel_path:<55} ERROR: {e}")
