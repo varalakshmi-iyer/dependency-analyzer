@@ -1,0 +1,448 @@
+import json, os, re, time, hashlib
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional
+
+import vertexai
+from vertexai.generative_models import GenerativeModel, GenerationConfig
+
+print("✅ Ready")
+
+
+# Load the structural map produced by the Archeologist notebook
+# Make sure you have run the Archeologist notebook first
+# and the artifact is saved at /tmp/structural_map.json
+
+with open("/tmp/structural_map.json") as f:
+    structural_map = json.load(f)
+
+print(f"Artifact ID    : {structural_map['artifact_id']}")
+print(f"Repo           : {structural_map['repo_url']}")
+print(f"Total nodes    : {len(structural_map['all_nodes'])}")
+print(f"Entry points   : {structural_map['entry_points']}")
+print(f"Ghost risks    : {len(structural_map['ghost_rule_candidates'])}")
+print(f"Dependencies   : {len(structural_map['dependencies'])}")
+
+print(f"\nLanguage breakdown:")
+for lang, stats in structural_map["language_summary"].items():
+    print(f"  {lang:<15} {stats['files']} files  {stats['nodes']} nodes")
+
+
+
+GCP_PROJECT = "your-gcp-project-id"   # ← change this
+GCP_REGION  = "us-central1"
+MODEL_NAME  = "gemini-1.5-pro"
+
+vertexai.init(project=GCP_PROJECT, location=GCP_REGION)
+model = GenerativeModel(MODEL_NAME)
+
+gen_config = GenerationConfig(
+    temperature=0.0,
+    max_output_tokens=4096,
+    response_mime_type="application/json",
+)
+
+print(f"✅ Vertex AI ready  project={GCP_PROJECT}  model={MODEL_NAME}")
+
+
+
+# The Auditor needs the actual source code to extract constraints
+# The structural map tells us which file and line each node lives at
+# This cell builds a cache of file contents for fast lookup
+
+CLONE_DIR = "/tmp/exp_repo"   # same as Archeologist notebook
+
+file_cache: Dict[str, str] = {}
+
+def get_source(file_path: str) -> str:
+    """Read and cache source file content."""
+    if file_path not in file_cache:
+        full = os.path.join(CLONE_DIR, file_path)
+        try:
+            file_cache[file_path] = open(full, encoding="utf-8", errors="replace").read()
+        except OSError:
+            file_cache[file_path] = ""
+    return file_cache[file_path]
+
+def extract_method_source(file_path: str, start_line: int, end_line: int = None, 
+                           window: int = 40) -> str:
+    """
+    Extract source lines around a node.
+    Uses end_line if available, otherwise takes a window of lines.
+    """
+    content = get_source(file_path)
+    if not content:
+        return ""
+    lines = content.split("\n")
+    start = max(0, start_line - 1)
+    end   = min(len(lines), end_line if end_line else start_line + window)
+    return "\n".join(f"{start_line + i:>4}  {line}" 
+                     for i, line in enumerate(lines[start:end]))
+
+# Test it on a real node
+sample_node = structural_map["all_nodes"][0]
+print(f"Sample node: {sample_node['name']}  [{sample_node['type']}]  {sample_node['file']}")
+print(f"\nSource extract:")
+print(extract_method_source(sample_node["file"], sample_node["line"]))
+
+
+
+# The Auditor follows the call graph from entry points
+# Dependencies in the structural map tell us what calls what
+
+def build_call_graph(structural_map: dict) -> Dict[str, List[str]]:
+    """
+    Build adjacency: method_name → [list of methods it calls]
+    Used to traverse from entry points through the full call chain.
+    """
+    graph = {}
+    for dep in structural_map["dependencies"]:
+        caller = dep.get("from", "")
+        callee = dep.get("to", "")
+        if caller and callee:
+            graph.setdefault(caller, []).append(callee)
+    return graph
+
+def build_node_index(structural_map: dict) -> Dict[str, dict]:
+    """Index all nodes by name for fast lookup."""
+    return {n["name"]: n for n in structural_map["all_nodes"]}
+
+call_graph  = build_call_graph(structural_map)
+node_index  = build_node_index(structural_map)
+
+print(f"Call graph entries : {len(call_graph)}")
+print(f"Node index entries : {len(node_index)}")
+
+# Show entry points and what they call
+print(f"\nEntry points and their direct calls:")
+for ep in structural_map["entry_points"][:5]:
+    calls = call_graph.get(ep, [])
+    print(f"  {ep}")
+    for c in calls[:5]:
+        print(f"    → {c}")
+
+
+
+
+# This is the core of the Auditor agent
+# For each node it sends the actual source to Gemini
+# and asks for formal constraints — not descriptions
+
+CONSTRAINT_PROMPT = f"""You are the Auditor agent in a legacy payments modernisation pipeline.
+
+Your job is to extract every business rule and constraint from this code
+expressed in language-agnostic form — completely independent of the programming language.
+
+File        : {file_path}
+Language    : {language}
+Method/Unit : {method_name}
+Description : {description}
+Ghost Risk  : {ghost_risk}
+Ghost Reason: {ghost_reason}
+
+Source code:
+
+{source_code}
+
+Extract ALL constraints this code enforces. For each constraint provide:
+{{
+  "constraints": [
+    {{
+      "id":           "C001",
+      "type":         "validation | business_rule | error_handling | temporal | state_transition | security",
+      "statement":    "plain English rule e.g. amount MUST be greater than zero",
+      "condition":    "the condition being checked",
+      "violation":    "what happens if this constraint is violated",
+      "confidence":   "certain | probable | suspected",
+      "is_ghost_rule": true/false,
+      "ghost_reason": "why this is a ghost rule or null",
+      "assumes_vendor_behaviour": true/false,
+      "vendor_assumption_detail": "what vendor specific behaviour this assumes or null"
+    }}
+  ],
+  "entry_point":       true/false,
+  "has_side_effects":  true/false,
+  "side_effects":      ["list of side effects e.g. writes to DB, publishes to queue"],
+  "calls_external":    true/false,
+  "external_systems":  ["list of external systems called"],
+  "overall_risk":      "low | medium | high | critical",
+  "auditor_notes":     "any important observations for the modernisation team"
+}}
+
+Respond ONLY with valid JSON. No markdown fences."""
+
+
+def extract_constraints(node: dict, language: str) -> Optional[dict]:
+    """
+    Core Auditor function.
+    Takes one node from the structural map, reads its source,
+    and extracts formal constraints via Gemini.
+    """
+    source = extract_method_source(
+        node["file"], node["line"],
+        end_line=node.get("end_line"),
+        window=50
+    )
+    if not source.strip():
+        return None
+
+    prompt = CONSTRAINT_PROMPT.format(
+        file_path   = node["file"],
+        language    = language,
+        method_name = node["name"],
+        description = node.get("description", "Not available"),
+        ghost_risk  = node.get("ghost_risk", False),
+        ghost_reason= node.get("ghost_risk_reason", "None"),
+        source_code = source,
+    )
+
+    try:
+        response = model.generate_content(prompt, generation_config=gen_config)
+        text = response.text.strip()
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+        return json.loads(text)
+    except Exception as e:
+        print(f"  ❌ Error for {node['name']}: {e}")
+        return None
+
+
+# Test on one node first
+sample = structural_map["all_nodes"][0]
+lang   = structural_map["language_summary"]
+# detect language from file extension
+def get_language(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    return {".java":"java",".py":"python",".js":"javascript",
+            ".ts":"typescript",".cbl":"cobol",".rpgle":"rpgle",
+            ".go":"go",".sql":"sql"}.get(ext, "unknown")
+
+print(f"Testing constraint extraction on: {sample['name']}")
+print(f"File: {sample['file']}\n")
+
+result = extract_constraints(sample, get_language(sample["file"]))
+
+if result:
+    print(f"Overall risk   : {result.get('overall_risk')}")
+    print(f"Entry point    : {result.get('entry_point')}")
+    print(f"Side effects   : {result.get('side_effects')}")
+    print(f"External calls : {result.get('external_systems')}")
+    print(f"\nConstraints found: {len(result.get('constraints', []))}")
+    for c in result.get("constraints", []):
+        ghost  = " ⚑ GHOST" if c.get("is_ghost_rule") else ""
+        vendor = " ⚠ VENDOR ASSUMPTION" if c.get("assumes_vendor_behaviour") else ""
+        print(f"\n  [{c['id']}] {c['type'].upper()}{ghost}{vendor}")
+        print(f"  Rule      : {c['statement']}")
+        print(f"  Violation : {c['violation']}")
+        print(f"  Confidence: {c['confidence']}")
+        if c.get("ghost_reason"):
+            print(f"  Ghost note: {c['ghost_reason']}")
+        if c.get("vendor_assumption_detail"):
+            print(f"  Vendor note: {c['vendor_assumption_detail']}")
+
+
+# Run constraint extraction across:
+# 1. All entry points          — start of every execution path
+# 2. All ghost rule candidates — highest risk nodes
+# 3. High complexity nodes     — most likely to hide constraints
+
+MAX_NODES = 15   # increase when comfortable with the output
+
+# Priority queue — entry points first, then ghost risks, then high complexity
+priority_nodes = []
+
+# 1. Entry points
+for name in structural_map["entry_points"]:
+    node = node_index.get(name)
+    if node:
+        priority_nodes.append(("entry_point", node))
+
+# 2. Ghost rule candidates
+for g in structural_map["ghost_rule_candidates"]:
+    if g["name"] not in [n["name"] for _, n in priority_nodes]:
+        priority_nodes.append(("ghost_risk", g))
+
+# 3. High complexity (complexity > 4) — fill remaining slots
+for node in structural_map["all_nodes"]:
+    if len(priority_nodes) >= MAX_NODES:
+        break
+    if (node.get("complexity", 0) > 4 and
+            node["name"] not in [n["name"] for _, n in priority_nodes]):
+        priority_nodes.append(("high_complexity", node))
+
+print(f"Nodes selected for audit: {len(priority_nodes)}")
+for reason, node in priority_nodes:
+    print(f"  [{reason:<16}] {node['name']:<35} complexity={node.get('complexity','-')}")
+
+
+
+
+
+# This is Artifact ② — the output of the Auditor agent
+# Consumed by the Reconciler
+
+constraint_model = {
+    "artifact_id":       hashlib.md5(f"auditor-{time.time()}".encode()).hexdigest()[:12],
+    "source_artifact_id": structural_map["artifact_id"],
+    "repo_url":          structural_map["repo_url"],
+    "created_at":        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "nodes_audited":     0,
+    "total_constraints": 0,
+    "ghost_rules":       [],
+    "vendor_assumptions":[],
+    "critical_nodes":    [],
+    "constraint_map":    {},   # node_name → full constraint result
+    "summary": {
+        "by_type":        {},
+        "by_confidence":  {},
+        "by_risk":        {},
+    }
+}
+
+print(f"Running Auditor on {len(priority_nodes)} nodes...\n")
+
+for reason, node in priority_nodes:
+    lang = get_language(node["file"])
+    print(f"{'─'*65}")
+    print(f"📋 {node['name']}  [{reason}]  file={node['file']}")
+
+    result = extract_constraints(node, lang)
+
+    if not result:
+        print(f"   ⚠️  No constraints extracted")
+        continue
+
+    # Store in constraint map
+    constraint_model["constraint_map"][node["name"]] = {
+        "node":        node,
+        "language":    lang,
+        "audit_result":result,
+        "audit_reason":reason,
+    }
+
+    constraint_model["nodes_audited"] += 1
+    constraints = result.get("constraints", [])
+    constraint_model["total_constraints"] += len(constraints)
+
+    # Collect ghost rules
+    for c in constraints:
+        if c.get("is_ghost_rule"):
+            constraint_model["ghost_rules"].append({
+                "node":       node["name"],
+                "file":       node["file"],
+                "constraint": c["statement"],
+                "reason":     c.get("ghost_reason", ""),
+                "confidence": c["confidence"],
+            })
+
+    # Collect vendor assumptions
+    for c in constraints:
+        if c.get("assumes_vendor_behaviour"):
+            constraint_model["vendor_assumptions"].append({
+                "node":   node["name"],
+                "file":   node["file"],
+                "detail": c.get("vendor_assumption_detail", ""),
+                "constraint": c["statement"],
+            })
+
+    # Collect critical nodes
+    if result.get("overall_risk") == "critical":
+        constraint_model["critical_nodes"].append(node["name"])
+
+    # Summary counts
+    for c in constraints:
+        t = c.get("type", "unknown")
+        constraint_model["summary"]["by_type"][t] = \
+            constraint_model["summary"]["by_type"].get(t, 0) + 1
+        conf = c.get("confidence", "unknown")
+        constraint_model["summary"]["by_confidence"][conf] = \
+            constraint_model["summary"]["by_confidence"].get(conf, 0) + 1
+
+    risk = result.get("overall_risk", "unknown")
+    constraint_model["summary"]["by_risk"][risk] = \
+        constraint_model["summary"]["by_risk"].get(risk, 0) + 1
+
+    # Print summary for this node
+    print(f"   Risk         : {result.get('overall_risk')}")
+    print(f"   Constraints  : {len(constraints)}")
+    print(f"   Ghost rules  : {sum(1 for c in constraints if c.get('is_ghost_rule'))}")
+    print(f"   Vendor deps  : {sum(1 for c in constraints if c.get('assumes_vendor_behaviour'))}")
+    print(f"   Side effects : {result.get('side_effects', [])}")
+
+# SHA-256
+import json as _json
+payload = _json.dumps(constraint_model, sort_keys=True, default=str)
+constraint_model["sha256"] = hashlib.sha256(payload.encode()).hexdigest()
+
+print(f"\n{'='*65}")
+print(f"ARTIFACT ②  — Logical Constraint Model")
+print(f"{'='*65}")
+print(f"  artifact_id      : {constraint_model['artifact_id']}")
+print(f"  source_artifact  : {constraint_model['source_artifact_id']}")
+print(f"  nodes audited    : {constraint_model['nodes_audited']}")
+print(f"  total constraints: {constraint_model['total_constraints']}")
+print(f"  ghost rules found: {len(constraint_model['ghost_rules'])}")
+print(f"  vendor assumptions:{len(constraint_model['vendor_assumptions'])}")
+print(f"  critical nodes   : {constraint_model['critical_nodes']}")
+print(f"  sha256           : {constraint_model['sha256'][:32]}...")
+print(f"\n  By constraint type:")
+for t, count in sorted(constraint_model["summary"]["by_type"].items()):
+    print(f"    {t:<20} {count}")
+print(f"\n  By confidence:")
+for c, count in sorted(constraint_model["summary"]["by_confidence"].items()):
+    print(f"    {c:<20} {count}")
+print(f"\n  By risk:")
+for r, count in sorted(constraint_model["summary"]["by_risk"].items()):
+    print(f"    {r:<20} {count}")
+
+
+
+# The most important output — what needs human review
+# before migration can proceed
+
+print("=" * 65)
+print("⚑  GHOST RULES  — require human SME review before migration")
+print("=" * 65)
+if constraint_model["ghost_rules"]:
+    for i, g in enumerate(constraint_model["ghost_rules"], 1):
+        print(f"\n  {i}. {g['node']}  ({g['file']})")
+        print(f"     Rule      : {g['constraint']}")
+        print(f"     Why ghost : {g['reason']}")
+        print(f"     Confidence: {g['confidence']}")
+else:
+    print("  None found")
+
+print(f"\n{'='*65}")
+print("⚠️  VENDOR ASSUMPTIONS  — behaviour tied to current processor")
+print("=" * 65)
+if constraint_model["vendor_assumptions"]:
+    for i, v in enumerate(constraint_model["vendor_assumptions"], 1):
+        print(f"\n  {i}. {v['node']}  ({v['file']})")
+        print(f"     Rule  : {v['constraint']}")
+        print(f"     Detail: {v['detail']}")
+else:
+    print("  None found")
+
+print(f"\n{'='*65}")
+print("🔴  CRITICAL NODES  — highest risk, audit first in full run")
+print("=" * 65)
+for name in constraint_model["critical_nodes"]:
+    entry = constraint_model["constraint_map"].get(name, {})
+    node  = entry.get("node", {})
+    print(f"  {name}  ({node.get('file','')})")
+
+
+# Save Artifact ② — this is the input to the Reconciler notebook
+
+output_path = "/tmp/constraint_model.json"
+with open(output_path, "w") as f:
+    json.dump(constraint_model, f, indent=2, default=str)
+
+print(f"✅ Artifact ② saved to {output_path}")
+print(f"\nWhat the Reconciler gets:")
+print(f"  - {constraint_model['nodes_audited']} nodes with formal constraints")
+print(f"  - {constraint_model['total_constraints']} language-agnostic rules")
+print(f"  - {len(constraint_model['ghost_rules'])} ghost rules flagged for SME review")
+print(f"  - {len(constraint_model['vendor_assumptions'])} vendor assumptions to re-verify against Processor B")
+print(f"  - SHA-256 fingerprint for pipeline traceability")
+print(f"\nNext: load /tmp/constraint_model.json in the Reconciler notebook")
+
