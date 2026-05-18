@@ -1,0 +1,423 @@
+import json, os, re, time, hashlib, urllib.request, urllib.error
+from typing import List, Dict, Optional
+
+import vertexai
+from vertexai.generative_models import GenerativeModel, GenerationConfig
+
+print("✅ Ready")
+
+
+
+
+with open("/tmp/structural_map.json") as f:
+    structural_map = json.load(f)
+
+with open("/tmp/constraint_model.json") as f:
+    constraint_model = json.load(f)
+
+print("=== Artifact ① — Archeologist ===")
+print(f"  artifact_id   : {structural_map['artifact_id']}")
+print(f"  repo_url      : {structural_map['repo_url']}")
+print(f"  nodes         : {len(structural_map['all_nodes'])}")
+print(f"  ghost risks   : {len(structural_map['ghost_rule_candidates'])}")
+
+print(f"\n=== Artifact ② — Auditor ===")
+print(f"  artifact_id   : {constraint_model['artifact_id']}")
+print(f"  constraints   : {constraint_model['total_constraints']}")
+print(f"  ghost rules   : {len(constraint_model['ghost_rules'])}")
+print(f"  vendor deps   : {len(constraint_model['vendor_assumptions'])}")
+
+# Verify chain
+if constraint_model["source_artifact_id"] == structural_map["artifact_id"]:
+    print(f"\n✅ Artifact chain intact")
+else:
+    print(f"\n❌ WARNING — chain broken. Re-run Archeologist and Auditor first.")
+
+
+
+
+
+
+
+GCP_PROJECT = "your-gcp-project-id"
+GCP_REGION  = "us-central1"
+MODEL_NAME  = "gemini-1.5-pro"
+
+vertexai.init(project=GCP_PROJECT, location=GCP_REGION)
+model = GenerativeModel(MODEL_NAME)
+
+gen_config = GenerationConfig(
+    temperature=0.0,
+    max_output_tokens=4096,
+    response_mime_type="application/json",
+)
+
+print(f"✅ Vertex AI ready  project={GCP_PROJECT}  model={MODEL_NAME}")
+
+
+
+
+
+
+
+
+
+# ── Single flag controls both modes ───────────────────────────────
+# True  → processor migration A→B   (profiles + migration delta)
+# False → code modernisation only   (readiness assessment)
+
+PROCESSOR_B_IN_SCOPE = True    # ← change this
+
+print(f"Mode: {'Processor Migration (A→B)' if PROCESSOR_B_IN_SCOPE else 'Code Modernisation only'}")
+print("─" * 60)
+
+# ── Documents — always include A and internal docs ─────────────────
+# Add Processor B docs only when in scope
+
+DOC_SOURCES = [
+    ("architecture_doc", "text", """
+        Payment processing architecture:
+        - All ACH transactions routed through Processor A
+        - Settlement cutoff is 14:00 ET for same-day
+        - Retry maximum 3 times with 2 second intervals
+        - Status SETTLED_99 means accepted by processor
+        - Amount must be positive, daily limit 1000000
+        - TEST accounts are sandbox only
+    """),
+
+    ("business_rules", "text", """
+        Business rules:
+        - Payments above 10000 require dual authorisation
+        - Failed payments must be logged to audit trail
+        - Refunds only within 90 days
+        - Currency must be USD for domestic ACH
+    """),
+
+    ("processor_a_guide", "text", """
+        Processor A Integration Guide:
+        - REST API: POST /api/v1/payments
+        - Auth: API Key in header
+        - Response timeout: 5 seconds
+        - Settlement cutoff: 14:00 ET
+        - Success code: SETTLED_99
+        - Retry: max 3 attempts
+        - Amount limit: 1000000
+    """),
+]
+
+# Only add Processor B docs when migration is in scope
+if PROCESSOR_B_IN_SCOPE:
+    DOC_SOURCES.append(
+        ("processor_b_guide", "text", """
+            Processor B Integration Guide:
+            - REST API: POST /api/v2/payments
+            - Auth: OAuth2 Bearer token
+            - Response timeout: 8 seconds
+            - Settlement cutoff: 15:00 ET
+            - Success code: ACCEPTED
+            - Retry: max 5 attempts
+            - Amount limit: 5000000
+        """)
+    )
+
+print(f"Document sources loaded: {len(DOC_SOURCES)}")
+for label, dtype, content in DOC_SOURCES:
+    preview = content[:60].strip().replace("\n", " ")
+    print(f"  [{dtype:<6}] {label:<25} {preview}...")
+
+
+
+
+
+
+
+
+
+
+
+
+SECRET_PATTERNS = [
+    (re.compile(r"(?i)(api[_-]?key|token|password)\s*[=:]\s*['\"]?([A-Za-z0-9\-_]{16,})['\"]?"), "SECRET"),
+    (re.compile(r"-----BEGIN (RSA )?PRIVATE KEY-----"), "PRIVATE_KEY"),
+    (re.compile(r"ghp_[A-Za-z0-9]{36}"), "GITHUB_TOKEN"),
+]
+
+def sanitise(text: str) -> str:
+    for pattern, label in SECRET_PATTERNS:
+        text = pattern.sub(f"[{label}_REDACTED]", text)
+    return text
+
+def fetch_url(url: str) -> str:
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Librarian-Agent/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            raw = re.sub(r"<style[^>]*>.*?</style>", "", raw, flags=re.DOTALL)
+            raw = re.sub(r"<script[^>]*>.*?</script>", "", raw, flags=re.DOTALL)
+            raw = re.sub(r"<[^>]+>", " ", raw)
+            raw = re.sub(r"\s+", " ", raw).strip()
+            return sanitise(raw[:20000])
+    except Exception as e:
+        print(f"  ⚠️  Could not fetch {url}: {e}")
+        return ""
+
+def load_documents(sources: list) -> Dict[str, str]:
+    docs = {}
+    for label, dtype, content in sources:
+        print(f"  Loading [{dtype}] {label}...", end=" ")
+        if dtype == "url":
+            text = fetch_url(content)
+        elif dtype == "text":
+            text = sanitise(content.strip())
+        elif dtype in ("confluence", "jira"):
+            text = fetch_url(content)
+        else:
+            text = content
+        docs[label] = text
+        print(f"✅ {len(text)} chars")
+    return docs
+
+print("Loading documents...")
+documents = load_documents(DOC_SOURCES)
+print(f"\n✅ {len(documents)} documents loaded")
+
+
+
+
+
+
+
+
+
+
+
+
+EXTRACT_REQUIREMENTS_PROMPT = """You are the Librarian agent in a payments
+modernisation pipeline.
+
+Extract all business requirements, rules, and constraints from this document.
+Focus on: amounts, timeouts, status codes, settlement windows, retry rules,
+validation rules, processor-specific behaviour, and integration details.
+
+Document label : {label}
+Document text  :
+{text}
+
+Return JSON:
+{{
+  "requirements": [
+    {{
+      "req_id":     "REQ-001",
+      "statement":  "plain English requirement",
+      "category":   "validation | timing | settlement | integration | security | business_rule",
+      "source":     "{label}",
+      "keywords":   ["key", "terms"],
+      "is_processor_specific": true,
+      "processor_name": "Processor A or B or null",
+      "replaces_req_id": "REQ-XXX or null"
+    }}
+  ],
+  "glossary_terms": [
+    {{
+      "term":       "SETTLED_99",
+      "definition": "Status code returned by Processor A",
+      "source":     "{label}"
+    }}
+  ],
+  "doc_summary": "2 sentence summary of this document"
+}}
+
+Respond ONLY with valid JSON. No markdown fences."""
+
+
+def extract_requirements_from_doc(label: str, text: str) -> Optional[dict]:
+    if not text or len(text) < 50:
+        return None
+    prompt = EXTRACT_REQUIREMENTS_PROMPT.format(
+        label=label, text=text[:8000]
+    )
+    try:
+        response = model.generate_content(prompt, generation_config=gen_config)
+        raw = response.text.strip()
+        raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+        raw = re.sub(r"\n?```\s*$", "", raw)
+        return json.loads(raw)
+    except Exception as e:
+        print(f"  ❌ {label}: {e}")
+        return None
+
+
+doc_requirements = {}
+
+print(f"Extracting requirements from {len(documents)} documents...\n")
+for label, text in documents.items():
+    print(f"{'─'*60}")
+    print(f"📄 {label}")
+    result = extract_requirements_from_doc(label, text)
+    if result:
+        doc_requirements[label] = result
+        reqs  = result.get("requirements", [])
+        terms = result.get("glossary_terms", [])
+        print(f"   Summary : {result.get('doc_summary','')[:100]}")
+        print(f"   Reqs    : {len(reqs)}   Glossary: {len(terms)}")
+        for r in reqs[:3]:
+            proc = f"  [{r.get('processor_name','')}]" if r.get("is_processor_specific") else ""
+            print(f"   {r['req_id']}  {r['statement'][:65]}{proc}")
+    else:
+        print(f"   ⚠️  No requirements extracted")
+
+print(f"\n✅ Done")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+all_requirements = []
+glossary         = {}
+
+for label, result in doc_requirements.items():
+    for req in result.get("requirements", []):
+        req["source_label"] = label
+        all_requirements.append(req)
+    for term in result.get("glossary_terms", []):
+        glossary[term["term"]] = {
+            "definition": term["definition"],
+            "source":     term["source"],
+        }
+
+print(f"Total requirements : {len(all_requirements)}")
+print(f"Glossary terms     : {len(glossary)}")
+
+print(f"\nBy category:")
+by_cat = {}
+for r in all_requirements:
+    by_cat[r.get("category","unknown")] = by_cat.get(r.get("category","unknown"), 0) + 1
+for cat, count in sorted(by_cat.items()):
+    print(f"  {cat:<20} {count}")
+
+print(f"\nProcessor-specific requirements:")
+for r in all_requirements:
+    if r.get("is_processor_specific"):
+        print(f"  [{r.get('processor_name','?'):<12}] {r['req_id']}  {r['statement'][:65]}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def format_requirements_for_prompt(reqs, max_reqs=20):
+    return "\n".join(
+        f"  {r['req_id']} [{r['category']}] ({r['source_label']}): {r['statement']}"
+        for r in reqs[:max_reqs]
+    )
+
+def format_glossary_for_prompt(glossary, max_terms=15):
+    return "\n".join(
+        f"  {term}: {data['definition']}"
+        for term, data in list(glossary.items())[:max_terms]
+    )
+
+
+MATCH_PROMPT = """You are the Librarian agent matching code constraints to docs.
+
+CONSTRAINT:
+  Node       : {node_name}
+  File       : {file_path}
+  Statement  : {constraint_statement}
+  Type       : {constraint_type}
+  Ghost rule : {is_ghost}
+  Ghost reason: {ghost_reason}
+  Confidence : {confidence}
+
+REQUIREMENTS FROM DOCUMENTATION:
+{requirements_text}
+
+GLOSSARY:
+{glossary_text}
+
+Return JSON:
+{{
+  "matched":           true,
+  "match_strength":    "exact | partial | inferred | none",
+  "matched_req_ids":   ["REQ-001"],
+  "match_explanation": "why this matches",
+  "gap":               false,
+  "gap_reason":        "null if matched, else why no doc evidence",
+  "is_ghost_rule_confirmed": false,
+  "ghost_rule_doc_evidence": "quote or null",
+  "processor_delta":   false,
+  "processor_delta_detail": "null or description of A vs B difference",
+  "recommendation":    "PROCEED | SME_REVIEW | VENDOR_VERIFY | DOCUMENT_FIRST"
+}}
+
+Respond ONLY with valid JSON. No markdown fences."""
+
+
+def match_constraint_to_requirements(node_name, file_path,
+                                      constraint, all_requirements, glossary):
+    prompt = MATCH_PROMPT.format(
+        node_name            = node_name,
+        file_path            = file_path,
+        constraint_statement = constraint.get("statement", ""),
+        constraint_type      = constraint.get("type", ""),
+        is_ghost             = constraint.get("is_ghost_rule", False),
+        ghost_reason         = constraint.get("ghost_reason", "None"),
+        confidence           = constraint.get("confidence", ""),
+        requirements_text    = format_requirements_for_prompt(all_requirements),
+        glossary_text        = format_glossary_for_prompt(glossary),
+    )
+    try:
+        response = model.generate_content(prompt, generation_config=gen_config)
+        raw = response.text.strip()
+        raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+        raw = re.sub(r"\n?```\s*$", "", raw)
+        return json.loads(raw)
+    except Exception as e:
+        print(f"    ❌ Match error: {e}")
+        return None
+
+
+# Test on one constraint
+test_node, test_constraint = None, None
+for node_name, entry in constraint_model["constraint_map"].items():
+    constraints = entry.get("audit_result", {}).get("constraints", [])
+    if constraints:
+        test_node       = entry["node"]
+        test_constraint = constraints[0]
+        break
+
+if test_node and test_constraint:
+    print(f"Testing: {test_node['name']}  —  {test_constraint['statement'][:60]}\n")
+    match = match_constraint_to_requirements(
+        test_node["name"], test_node["file"],
+        test_constraint, all_requirements, glossary
+    )
+    if match:
+        print(f"  Matched        : {match['matched']}")
+        print(f"  Strength       : {match['match_strength']}")
+        print(f"  Matched reqs   : {match['matched_req_ids']}")
+        print(f"  Gap            : {match['gap']}")
+        print(f"  Processor delta: {match['processor_delta']}")
+        print(f"  Recommendation : {match['recommendation']}")
