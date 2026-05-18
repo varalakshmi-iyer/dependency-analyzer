@@ -1,0 +1,809 @@
+import json, os, re, time, hashlib
+from typing import List, Dict, Optional, Tuple
+
+import vertexai
+from vertexai.generative_models import GenerativeModel, GenerationConfig
+
+print("✅ Ready")
+
+
+
+
+# Cartographer reads ALL three upstream artifacts
+# ① Archeologist — structural maps, nodes, dependencies
+# ② Auditor      — constraints, ghost rules, complexity
+# ③ Librarian    — requirements match, processor profiles,
+#                  migration delta OR modernisation assessment
+
+with open("/tmp/structural_map.json") as f:
+    structural_map = json.load(f)
+
+with open("/tmp/constraint_model.json") as f:
+    constraint_model = json.load(f)
+
+with open("/tmp/semantic_map.json") as f:
+    semantic_map = json.load(f)
+
+# Read mode — single flag drives everything in this notebook
+MODE                 = semantic_map["mode"]
+PROCESSOR_B_IN_SCOPE = semantic_map["processor_b_in_scope"]
+
+print(f"=== Artifact ① Archeologist ===")
+print(f"  nodes       : {len(structural_map['all_nodes'])}")
+print(f"  entry points: {structural_map['entry_points']}")
+print(f"  ghost risks : {len(structural_map['ghost_rule_candidates'])}")
+
+print(f"\n=== Artifact ② Auditor ===")
+print(f"  constraints : {constraint_model['total_constraints']}")
+print(f"  ghost rules : {len(constraint_model['ghost_rules'])}")
+print(f"  critical    : {constraint_model['critical_nodes']}")
+
+print(f"\n=== Artifact ③ Librarian ===")
+print(f"  mode        : {MODE}")
+print(f"  proc B scope: {PROCESSOR_B_IN_SCOPE}")
+print(f"  gaps        : {len(semantic_map['gaps'])}")
+print(f"  ghost conf  : {len(semantic_map['ghost_confirmations'])}")
+
+if PROCESSOR_B_IN_SCOPE:
+    delta = semantic_map.get("migration_delta") or {}
+    print(f"  delta       : changed={len(delta.get('changed_integration_points',[]))} "
+          f"removed={len(delta.get('removed_integration_points',[]))} "
+          f"new={len(delta.get('new_integration_points',[]))}")
+else:
+    ma = semantic_map.get("modernisation_assessment") or {}
+    print(f"  readiness   : {ma.get('overall_readiness','n/a')}")
+    print(f"  safe nodes  : {len(ma.get('safe_to_modernise',[]))}")
+    print(f"  preserve    : {len(ma.get('must_preserve_exactly',[]))}")
+
+# Verify full chain
+chain_ok = (
+    constraint_model["source_artifact_id"] == structural_map["artifact_id"] and
+    semantic_map["source_artifact_ids"]["archeologist"] == structural_map["artifact_id"] and
+    semantic_map["source_artifact_ids"]["auditor"] == constraint_model["artifact_id"]
+)
+print(f"\n{'✅' if chain_ok else '❌'} Artifact chain {'intact' if chain_ok else 'BROKEN'}")
+
+
+
+
+
+GCP_PROJECT = "your-gcp-project-id"
+GCP_REGION  = "us-central1"
+MODEL_NAME  = "gemini-1.5-pro"
+
+vertexai.init(project=GCP_PROJECT, location=GCP_REGION)
+model = GenerativeModel(MODEL_NAME)
+
+gen_config = GenerationConfig(
+    temperature=0.0,
+    max_output_tokens=4096,
+    response_mime_type="application/json",
+)
+
+print(f"✅ Vertex AI ready  model={MODEL_NAME}  mode={MODE}")
+
+
+
+
+
+
+
+
+
+# Workflow nodes represent every service in the repo set
+# In migration mode: also adds Processor A and B as vendor nodes
+# In modernisation mode: service nodes only
+
+def get_node_status_modernisation(service_name: str,
+                                   modernisation_assessment: dict) -> str:
+    """
+    In modernisation mode, each node gets a status:
+    GREEN  = safe to modernise
+    RED    = must preserve exactly (ghost rule)
+    AMBER  = needs documentation first
+    BLUE   = no assessment — treat as unknown
+    """
+    safe  = [s["node"] for s in
+              modernisation_assessment.get("safe_to_modernise", [])]
+    exact = [s["node"] for s in
+              modernisation_assessment.get("must_preserve_exactly", [])]
+    doc   = [s["node"] for s in
+              modernisation_assessment.get("needs_documentation_first", [])]
+
+    if service_name in exact: return "RED"
+    if service_name in doc:   return "AMBER"
+    if service_name in safe:  return "GREEN"
+    return "BLUE"
+
+
+def build_workflow_nodes(structural_map: dict,
+                          semantic_map: dict,
+                          mode: str) -> List[dict]:
+    nodes = []
+    ma = semantic_map.get("modernisation_assessment") or {}
+    services_requiring_changes = semantic_map.get("services_requiring_changes", [])
+    services_untouched         = semantic_map.get("services_untouched", [])
+
+    # ── Service nodes — always built ──────────────────────────────
+    # In the notebook we have one repo so one primary service
+    # In production this loops over all N repos in the workflow
+    lang_summary = structural_map.get("language_summary", {})
+    languages    = list(lang_summary.keys())
+
+    primary_service = {
+        "node_id":          "primary",
+        "node_name":        structural_map["repo_url"].split("/")[-1],
+        "node_type":        "service",
+        "is_vendor":        False,
+        "is_globally_shared": False,
+        "languages":        languages,
+        "entry_points":     structural_map.get("entry_points", []),
+        "ghost_rule_count": len(structural_map.get("ghost_rule_candidates", [])),
+        "node_role":        "primary_service",
+    }
+
+    # Overlay mode-specific status
+    if mode == "code_modernisation":
+        primary_service["modernisation_status"] = get_node_status_modernisation(
+            "primary", ma
+        )
+        primary_service["requires_changes"] = True  # whole service being modernised
+        primary_service["migration_status"]  = None
+    else:
+        primary_service["modernisation_status"] = None
+        primary_service["requires_changes"] = "primary" in services_requiring_changes
+        primary_service["migration_status"]  = (
+            "requires_changes" if "primary" in services_requiring_changes
+            else "untouched"
+        )
+
+    nodes.append(primary_service)
+
+    # ── Vendor nodes — migration mode only ────────────────────────
+    if mode == "processor_migration":
+        proc_a = semantic_map.get("processor_a_profile")
+        proc_b = semantic_map.get("processor_b_profile")
+
+        if proc_a:
+            nodes.append({
+                "node_id":   proc_a["processor_id"],
+                "node_name": proc_a["processor_name"],
+                "node_type": "vendor",
+                "is_vendor": True,
+                "role":      "source — being replaced",
+                "integration_points": len(proc_a.get("integration_points", [])),
+                "auth":      proc_a.get("auth_mechanisms", []),
+                "protocols": proc_a.get("supported_protocols", []),
+                "modernisation_status": None,
+                "migration_status": "being_replaced",
+            })
+
+        if proc_b:
+            nodes.append({
+                "node_id":   proc_b["processor_id"],
+                "node_name": proc_b["processor_name"],
+                "node_type": "vendor",
+                "is_vendor": True,
+                "role":      "target — replacement",
+                "integration_points": len(proc_b.get("integration_points", [])),
+                "auth":      proc_b.get("auth_mechanisms", []),
+                "protocols": proc_b.get("supported_protocols", []),
+                "modernisation_status": None,
+                "migration_status": "incoming",
+            })
+
+    return nodes
+
+
+workflow_nodes = build_workflow_nodes(structural_map, semantic_map, MODE)
+
+print(f"Workflow nodes built: {len(workflow_nodes)}\n")
+print(f"{'ID':<20} {'NAME':<30} {'TYPE':<12} {'STATUS'}")
+print("─" * 80)
+for n in workflow_nodes:
+    status = (n.get("modernisation_status") or
+              n.get("migration_status") or "—")
+    icon = {"GREEN":"✅","RED":"🔴","AMBER":"🟡","BLUE":"🔵",
+            "being_replaced":"❌","incoming":"🆕",
+            "requires_changes":"⚠️","untouched":"✅"}.get(status, "")
+    print(f"{n['node_id']:<20} {n['node_name']:<30} "
+          f"{n['node_type']:<12} {icon} {status}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Edges represent cross-service calls and vendor integrations
+# In migration mode: includes service → Processor A/B edges
+# In modernisation mode: service → service edges only
+
+def build_workflow_edges(structural_map: dict,
+                          semantic_map:  dict,
+                          mode:          str) -> List[dict]:
+    edges = []
+    seen  = set()
+
+    def add_edge(source, target, pattern, sync=True,
+                 msg_format=None, sla=None, evidence=None):
+        key = f"{source}→{target}:{pattern}"
+        if key in seen:
+            return
+        seen.add(key)
+        edges.append({
+            "edge_id":       hashlib.md5(key.encode()).hexdigest()[:10],
+            "source":        source,
+            "target":        target,
+            "pattern":       pattern,
+            "is_synchronous":sync,
+            "message_format":msg_format,
+            "sla_seconds":   sla,
+            "evidence":      evidence,
+            "is_critical_path": False,  # set in Cell 6
+        })
+
+    # ── Cross-service edges from dependency graph ──────────────────
+    for dep in structural_map.get("dependencies", []):
+        src = dep.get("from", "")
+        tgt = dep.get("to", "")
+        if src and tgt and src != tgt:
+            add_edge("primary", "primary",  # same service in single-repo mode
+                     "internal_call", evidence=f"{src}→{tgt}")
+
+    # ── Vendor integration edges — migration mode only ─────────────
+    if mode == "processor_migration":
+        proc_a = semantic_map.get("processor_a_profile") or {}
+        proc_b = semantic_map.get("processor_b_profile") or {}
+
+        for ip in proc_a.get("integration_points", []):
+            add_edge(
+                source     = "primary",
+                target     = proc_a.get("processor_id", "processor_a"),
+                pattern    = ip.get("pattern", "rest_api"),
+                sync       = ip.get("is_synchronous", True),
+                msg_format = ip.get("message_format"),
+                sla        = ip.get("sla_seconds"),
+                evidence   = ip.get("endpoint"),
+            )
+
+        # Migration delta edges — show what changes
+        delta = semantic_map.get("migration_delta") or {}
+        for ip in delta.get("new_integration_points", []):
+            add_edge(
+                source  = "primary",
+                target  = proc_b.get("processor_id", "processor_b"),
+                pattern = ip.get("pattern", "rest_api"),
+                sla     = ip.get("sla_seconds"),
+                evidence= f"NEW: {ip.get('operation','')}",
+            )
+
+    return edges
+
+
+workflow_edges = build_workflow_edges(structural_map, semantic_map, MODE)
+
+print(f"Workflow edges built: {len(workflow_edges)}\n")
+print(f"{'SOURCE':<20} {'TARGET':<20} {'PATTERN':<18} {'SLA':<8} SYNC")
+print("─" * 80)
+for e in workflow_edges[:20]:
+    sla  = f"{e['sla_seconds']}s" if e.get("sla_seconds") else "—"
+    sync = "sync" if e["is_synchronous"] else "async"
+    print(f"{e['source']:<20} {e['target']:<20} "
+          f"{e['pattern']:<18} {sla:<8} {sync}")
+
+
+
+
+
+
+
+
+
+# Critical path — longest synchronous chain through the graph
+# Blast radius — shared service impact analysis
+# Both run identically in both modes
+
+def find_critical_path(nodes: List[dict],
+                        edges: List[dict]) -> List[str]:
+    """Longest synchronous chain from any initiator node."""
+    node_ids   = {n["node_id"] for n in nodes}
+    all_targets = {e["target"] for e in edges if e["is_synchronous"]}
+    initiators  = [n["node_id"] for n in nodes
+                   if n["node_id"] not in all_targets]
+    if not initiators:
+        initiators = [nodes[0]["node_id"]] if nodes else []
+
+    adj: Dict[str, List[str]] = {n["node_id"]: [] for n in nodes}
+    for e in edges:
+        if e["is_synchronous"] and e["source"] in adj:
+            adj[e["source"]].append(e["target"])
+
+    best = []
+
+    def dfs(node_id, path, visited):
+        nonlocal best
+        if len(path) > len(best):
+            best = list(path)
+        for neighbour in adj.get(node_id, []):
+            if neighbour not in visited:
+                dfs(neighbour, path + [neighbour], visited | {neighbour})
+
+    for initiator in initiators:
+        dfs(initiator, [initiator], {initiator})
+
+    # Mark critical path edges
+    for edge in edges:
+        if (edge["source"] in best and edge["target"] in best):
+            edge["is_critical_path"] = True
+
+    return best
+
+
+def analyse_blast_radius(nodes:          List[dict],
+                          semantic_map:   dict,
+                          mode:           str) -> List[dict]:
+    """
+    In both modes: flag shared services.
+    In modernisation mode: also flag nodes whose ghost rules
+    affect downstream dependencies.
+    """
+    risks = []
+    ghost_nodes = {g["node"] for g in
+                   constraint_model.get("ghost_rules", [])}
+
+    for node in nodes:
+        if node.get("is_vendor"):
+            continue
+
+        # Check if globally shared (multi-repo — from repo input metadata)
+        # In single-repo notebook we simulate with ghost rule count
+        is_high_risk = node.get("ghost_rule_count", 0) > 0
+
+        if is_high_risk:
+            if mode == "code_modernisation":
+                risks.append({
+                    "service_id":   node["node_id"],
+                    "service_name": node["node_name"],
+                    "risk_type":    "ghost_rule_blast_radius",
+                    "risk_level":   "HIGH",
+                    "detail":       (
+                        f"{node['ghost_rule_count']} ghost rule(s) — "
+                        f"if semantics break during modernisation, "
+                        f"all callers of this service are affected"
+                    ),
+                    "recommended_action": (
+                        "Resolve ghost rules before modernising. "
+                        "Add characterisation tests first."
+                    ),
+                })
+            else:
+                risks.append({
+                    "service_id":   node["node_id"],
+                    "service_name": node["node_name"],
+                    "risk_type":    "integration_blast_radius",
+                    "risk_level":   "HIGH",
+                    "detail":       (
+                        "Service has ghost rules at processor integration boundary. "
+                        "Migration may silently break behaviour."
+                    ),
+                    "recommended_action": "SME review before migration delta applied.",
+                })
+
+    return risks
+
+
+critical_path  = find_critical_path(workflow_nodes, workflow_edges)
+blast_radius   = analyse_blast_radius(workflow_nodes, semantic_map, MODE)
+
+print(f"Critical path  : {' → '.join(critical_path) or 'single node'}")
+print(f"Blast radius risks: {len(blast_radius)}\n")
+for r in blast_radius:
+    print(f"  [{r['risk_level']}] {r['service_name']}")
+    print(f"    {r['detail']}")
+    print(f"    Action: {r['recommended_action']}")
+
+
+
+
+
+
+
+
+
+
+
+# This cell is the key addition for code modernisation mode
+# It traces which downstream nodes depend on ghost rule nodes
+# So Developer knows: fix this ghost rule wrong → these things break
+
+ghost_dependency_chains = []
+
+if MODE == "code_modernisation":
+    print("Tracing ghost rule dependency chains...\n")
+
+    ghost_nodes = {g["node"]: g for g in
+                   constraint_model.get("ghost_rules", [])}
+
+    # Build reverse dependency map from structural map
+    # who calls whom
+    reverse_deps: Dict[str, List[str]] = {}
+    for dep in structural_map.get("dependencies", []):
+        target = dep.get("to", "")
+        source = dep.get("from", "")
+        if target and source:
+            reverse_deps.setdefault(target, []).append(source)
+
+    # For each ghost rule node, trace callers
+    node_index = {n["name"]: n for n in structural_map["all_nodes"]}
+
+    for ghost_name, ghost_info in ghost_nodes.items():
+        callers = reverse_deps.get(ghost_name, [])
+        # Also check which nodes call this via dependency list
+        direct_callers = [
+            dep.get("from","") for dep in structural_map.get("dependencies",[])
+            if dep.get("to","") == ghost_name
+        ]
+        all_callers = list(set(callers + direct_callers))
+
+        chain = {
+            "ghost_rule_node":  ghost_name,
+            "file":             ghost_info.get("file",""),
+            "constraint":       ghost_info.get("constraint",""),
+            "confidence":       ghost_info.get("confidence",""),
+            "direct_callers":   all_callers,
+            "blast_radius":     len(all_callers),
+            "risk_level":       (
+                "CRITICAL" if len(all_callers) > 3 else
+                "HIGH"     if len(all_callers) > 1 else
+                "MEDIUM"
+            ),
+            "modernisation_guidance": (
+                "PRESERVE_EXACTLY — do not change semantics. "
+                "Write characterisation tests before modernising callers."
+                if len(all_callers) > 0
+                else "PRESERVE_EXACTLY — isolated ghost rule, lower blast radius."
+            ),
+        }
+        ghost_dependency_chains.append(chain)
+
+    print(f"Ghost rule dependency chains: {len(ghost_dependency_chains)}\n")
+    print(f"{'='*65}")
+    for chain in ghost_dependency_chains:
+        icon = ("🔴" if chain["risk_level"] == "CRITICAL" else
+                "🟠" if chain["risk_level"] == "HIGH" else "🟡")
+        print(f"\n{icon} [{chain['risk_level']}] {chain['ghost_rule_node']}")
+        print(f"   File       : {chain['file']}")
+        print(f"   Constraint : {chain['constraint']}")
+        print(f"   Confidence : {chain['confidence']}")
+        print(f"   Callers    : {chain['direct_callers'] or 'none detected'}")
+        print(f"   Blast radius: {chain['blast_radius']} direct caller(s)")
+        print(f"   Guidance   : {chain['modernisation_guidance']}")
+
+elif MODE == "processor_migration":
+    print("⏭  Ghost dependency chain tracing runs in code_modernisation mode only")
+    print("   In migration mode ghost rules are handled by migration delta")
+    ghost_dependency_chains = []
+
+
+
+
+
+
+
+
+
+
+
+
+# LLM synthesises the full graph analysis into actionable output
+# Prompt branches on mode
+
+CARTOGRAPHER_PROMPT_MIGRATION = """You are the Cartographer agent in a
+payments modernisation pipeline.
+
+Mode: PROCESSOR MIGRATION (Processor A → Processor B)
+
+Workflow graph:
+  Nodes: {nodes}
+  Edges: {edge_count}
+  Critical path: {critical_path}
+
+Shared service risks:
+{blast_radius}
+
+Migration delta summary:
+  Changed  : {changed}
+  Removed  : {removed}
+  New      : {new}
+  Unchanged: {unchanged}
+  Complexity: {complexity}
+
+Temporal assumptions at risk:
+{temporal}
+
+Return JSON:
+{{
+  "migration_sequence": ["ordered list of services to migrate"],
+  "top_risks": ["top 5 migration risks for this workflow"],
+  "human_review_items": ["specific items needing SME attention"],
+  "safe_to_automate": ["items safe for automated migration"],
+  "cartographer_notes": "2-3 sentence workflow topology summary"
+}}
+
+Respond ONLY with valid JSON. No markdown fences."""
+
+
+CARTOGRAPHER_PROMPT_MODERNISATION = """You are the Cartographer agent in a
+payments modernisation pipeline.
+
+Mode: CODE MODERNISATION (no processor migration — Processor A stays as-is)
+
+Workflow graph:
+  Nodes: {nodes}
+  Edges: {edge_count}
+  Critical path: {critical_path}
+
+Node modernisation status:
+{node_status}
+
+Ghost rule dependency chains:
+{ghost_chains}
+
+Blast radius risks:
+{blast_radius}
+
+Tech debt items:
+{tech_debt}
+
+Temporal assumptions (to make configurable):
+{temporal}
+
+Return JSON:
+{{
+  "modernisation_sequence": ["ordered list — safest to modernise first"],
+  "top_risks": ["top 5 risks during code modernisation"],
+  "must_do_first": ["things that must happen before any code changes"],
+  "safe_to_automate": ["nodes that can be modernised with low risk"],
+  "preserve_exactly": ["nodes that must have identical behaviour"],
+  "cartographer_notes": "2-3 sentence modernisation topology summary"
+}}
+
+Respond ONLY with valid JSON. No markdown fences."""
+
+
+def run_cartographer_llm(mode, workflow_nodes, workflow_edges,
+                          critical_path, blast_radius,
+                          ghost_dependency_chains, semantic_map):
+    ma    = semantic_map.get("modernisation_assessment") or {}
+    delta = semantic_map.get("migration_delta") or {}
+
+    nodes_text = "\n".join(
+        f"  {n['node_id']} [{n['node_type']}] "
+        f"status={n.get('modernisation_status') or n.get('migration_status','?')}"
+        for n in workflow_nodes
+    )
+    blast_text = "\n".join(
+        f"  {r['service_name']}: {r['detail']}"
+        for r in blast_radius
+    ) or "None"
+    temporal_text = "\n".join(
+        f"  {t['node']}: {t['code_assumption']} → {t['action']}"
+        for t in semantic_map.get("temporal_at_risk", [])[:10]
+    ) or "None"
+
+    if mode == "processor_migration":
+        prompt = CARTOGRAPHER_PROMPT_MIGRATION.format(
+            nodes       = nodes_text,
+            edge_count  = len(workflow_edges),
+            critical_path = " → ".join(critical_path) or "single node",
+            blast_radius = blast_text,
+            changed     = len(delta.get("changed_integration_points",[])),
+            removed     = len(delta.get("removed_integration_points",[])),
+            new         = len(delta.get("new_integration_points",[])),
+            unchanged   = len(delta.get("unchanged_integration_points",[])),
+            complexity  = delta.get("overall_complexity","unknown"),
+            temporal    = temporal_text,
+        )
+    else:
+        node_status_text = "\n".join(
+            f"  {n['node_id']}: {n.get('modernisation_status','BLUE')}"
+            for n in workflow_nodes if not n.get("is_vendor")
+        )
+        ghost_text = "\n".join(
+            f"  {c['ghost_rule_node']} [{c['risk_level']}] "
+            f"blast={c['blast_radius']} callers"
+            for c in ghost_dependency_chains
+        ) or "None"
+        debt_text = "\n".join(
+            f"  {t.get('location','?')}: {t.get('description','')[:60]}"
+            for t in ma.get("tech_debt_found", [])[:8]
+        ) or "None"
+
+        prompt = CARTOGRAPHER_PROMPT_MODERNISATION.format(
+            nodes        = nodes_text,
+            edge_count   = len(workflow_edges),
+            critical_path= " → ".join(critical_path) or "single node",
+            node_status  = node_status_text,
+            ghost_chains = ghost_text,
+            blast_radius = blast_text,
+            tech_debt    = debt_text,
+            temporal     = temporal_text,
+        )
+
+    try:
+        response = model.generate_content(prompt, generation_config=gen_config)
+        raw = response.text.strip()
+        raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+        raw = re.sub(r"\n?```\s*$", "", raw)
+        return json.loads(raw)
+    except Exception as e:
+        print(f"❌ LLM error: {e}")
+        return None
+
+
+print(f"Running Cartographer LLM synthesis in [{MODE}] mode...\n")
+cartographer_llm_output = run_cartographer_llm(
+    MODE, workflow_nodes, workflow_edges,
+    critical_path, blast_radius,
+    ghost_dependency_chains, semantic_map
+)
+
+if cartographer_llm_output:
+    print(f"Notes: {cartographer_llm_output.get('cartographer_notes','')}")
+    print(f"\nTop risks:")
+    for r in cartographer_llm_output.get("top_risks", []):
+        print(f"  ⚠️  {r}")
+    print(f"\nMust do first:")
+    for item in cartographer_llm_output.get("must_do_first",
+                cartographer_llm_output.get("human_review_items",[])):
+        print(f"  📌 {item}")
+    if MODE == "processor_migration":
+        print(f"\nMigration sequence:")
+        for i, svc in enumerate(
+                cartographer_llm_output.get("migration_sequence",[]), 1):
+            print(f"  {i}. {svc}")
+    else:
+        print(f"\nModernisation sequence (safest first):")
+        for i, svc in enumerate(
+                cartographer_llm_output.get("modernisation_sequence",[]), 1):
+            print(f"  {i}. {svc}")
+        print(f"\nPreserve exactly:")
+        for p in cartographer_llm_output.get("preserve_exactly",[]):
+            print(f"  🔒 {p}")
+        print(f"\nSafe to automate:")
+        for s in cartographer_llm_output.get("safe_to_automate",[]):
+            print(f"  ✅ {s}")
+
+
+
+
+
+
+
+
+
+
+
+
+# Artifact ④ — Cartographer Output
+# Input to the Reconciler agent
+
+cartographer_output = {
+    "artifact_id": hashlib.md5(f"cartographer-{time.time()}".encode()).hexdigest()[:12],
+    "source_artifact_ids": {
+        "archeologist": structural_map["artifact_id"],
+        "auditor":      constraint_model["artifact_id"],
+        "librarian":    semantic_map["artifact_id"],
+    },
+    "repo_url":             structural_map["repo_url"],
+    "created_at":           time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "mode":                 MODE,
+    "processor_b_in_scope": PROCESSOR_B_IN_SCOPE,
+
+    # Graph
+    "workflow_nodes":       workflow_nodes,
+    "workflow_edges":       workflow_edges,
+    "critical_path":        critical_path,
+    "blast_radius_risks":   blast_radius,
+
+    # Mode-specific
+    "ghost_dependency_chains": ghost_dependency_chains,   # modernisation only
+    "migration_delta": (                                   # migration only
+        semantic_map.get("migration_delta")
+        if PROCESSOR_B_IN_SCOPE else None
+    ),
+    "modernisation_assessment": (                          # modernisation only
+        semantic_map.get("modernisation_assessment")
+        if not PROCESSOR_B_IN_SCOPE else None
+    ),
+
+    # Temporal
+    "temporal_at_risk": semantic_map.get("temporal_at_risk", []),
+
+    # LLM synthesis
+    "llm_output": cartographer_llm_output,
+
+    "summary": {
+        "mode":              MODE,
+        "total_nodes":       len(workflow_nodes),
+        "total_edges":       len(workflow_edges),
+        "critical_path_len": len(critical_path),
+        "blast_radius_count":len(blast_radius),
+        "temporal_at_risk":  len(semantic_map.get("temporal_at_risk",[])),
+    }
+}
+
+# Mode-specific summary additions
+if PROCESSOR_B_IN_SCOPE:
+    delta = semantic_map.get("migration_delta") or {}
+    cartographer_output["summary"]["migration"] = {
+        "changed":    len(delta.get("changed_integration_points",[])),
+        "removed":    len(delta.get("removed_integration_points",[])),
+        "new":        len(delta.get("new_integration_points",[])),
+        "unchanged":  len(delta.get("unchanged_integration_points",[])),
+        "complexity": delta.get("overall_complexity","unknown"),
+    }
+else:
+    cartographer_output["summary"]["modernisation"] = {
+        "ghost_chains":      len(ghost_dependency_chains),
+        "critical_ghosts":   sum(1 for c in ghost_dependency_chains
+                                 if c["risk_level"] == "CRITICAL"),
+        "safe_nodes":        len([n for n in workflow_nodes
+                                  if n.get("modernisation_status") == "GREEN"]),
+        "preserve_nodes":    len([n for n in workflow_nodes
+                                  if n.get("modernisation_status") == "RED"]),
+        "amber_nodes":       len([n for n in workflow_nodes
+                                  if n.get("modernisation_status") == "AMBER"]),
+    }
+
+# SHA-256
+payload = json.dumps(cartographer_output, sort_keys=True, default=str)
+cartographer_output["sha256"] = hashlib.sha256(payload.encode()).hexdigest()
+
+with open("/tmp/cartographer_output.json", "w") as f:
+    json.dump(cartographer_output, f, indent=2, default=str)
+
+print("=" * 65)
+print(f"ARTIFACT ④ — Cartographer Output")
+print(f"Mode : {'Processor Migration' if PROCESSOR_B_IN_SCOPE else 'Code Modernisation'}")
+print("=" * 65)
+print(f"  artifact_id      : {cartographer_output['artifact_id']}")
+print(f"  sha256           : {cartographer_output['sha256'][:32]}...")
+print(f"  nodes            : {cartographer_output['summary']['total_nodes']}")
+print(f"  edges            : {cartographer_output['summary']['total_edges']}")
+print(f"  critical path    : {' → '.join(critical_path) or 'single node'}")
+print(f"  blast risks      : {cartographer_output['summary']['blast_radius_count']}")
+print(f"  temporal at risk : {cartographer_output['summary']['temporal_at_risk']}")
+
+if PROCESSOR_B_IN_SCOPE:
+    m = cartographer_output["summary"]["migration"]
+    print(f"\n  Migration delta:")
+    print(f"    changed   : {m['changed']}")
+    print(f"    removed   : {m['removed']}")
+    print(f"    new       : {m['new']}")
+    print(f"    unchanged : {m['unchanged']}")
+    print(f"    complexity: {m['complexity']}")
+else:
+    m = cartographer_output["summary"]["modernisation"]
+    print(f"\n  Modernisation topology:")
+    print(f"    ghost chains     : {m['ghost_chains']}")
+    print(f"    critical ghosts  : {m['critical_ghosts']}")
+    print(f"    ✅ safe nodes    : {m['safe_nodes']}")
+    print(f"    🔴 preserve nodes: {m['preserve_nodes']}")
+    print(f"    🟡 amber nodes   : {m['amber_nodes']}")
+
+print(f"\n✅ Artifact ④ saved to /tmp/cartographer_output.json")
+print(f"   Next: Reconciler reads mode='{MODE}' and builds the blueprint")
+
+
+
+
+
