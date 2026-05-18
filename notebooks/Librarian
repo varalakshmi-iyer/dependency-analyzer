@@ -421,3 +421,749 @@ if test_node and test_constraint:
         print(f"  Gap            : {match['gap']}")
         print(f"  Processor delta: {match['processor_delta']}")
         print(f"  Recommendation : {match['recommendation']}")
+
+
+
+
+
+
+
+
+MAX_CONSTRAINTS = 20
+
+requirement_map    = []
+gaps               = []
+ghost_confirmations= []
+processor_deltas   = []
+
+print(f"Running Librarian constraint matching...\n")
+constraint_count = 0
+
+for node_name, entry in constraint_model["constraint_map"].items():
+    constraints  = entry.get("audit_result", {}).get("constraints", [])
+    node         = entry.get("node", {})
+    if not constraints:
+        continue
+
+    print(f"\n{'─'*60}")
+    print(f"📋 {node_name}  ({node.get('file','')})")
+
+    for constraint in constraints:
+        if constraint_count >= MAX_CONSTRAINTS:
+            break
+        constraint_count += 1
+
+        match = match_constraint_to_requirements(
+            node_name, node.get("file",""),
+            constraint, all_requirements, glossary
+        )
+        if not match:
+            continue
+
+        record = {"node_name": node_name, "file": node.get("file",""),
+                  "constraint": constraint, "match": match}
+        requirement_map.append(record)
+
+        if match.get("gap"):
+            gaps.append({
+                "node":           node_name,
+                "file":           node.get("file",""),
+                "constraint":     constraint["statement"],
+                "gap_reason":     match.get("gap_reason",""),
+                "recommendation": match.get("recommendation",""),
+            })
+
+        if constraint.get("is_ghost_rule"):
+            ghost_confirmations.append({
+                "node":           node_name,
+                "constraint":     constraint["statement"],
+                "confirmed":      match.get("is_ghost_rule_confirmed", False),
+                "evidence":       match.get("ghost_rule_doc_evidence",""),
+                "recommendation": match.get("recommendation",""),
+            })
+
+        if match.get("processor_delta"):
+            processor_deltas.append({
+                "node":       node_name,
+                "constraint": constraint["statement"],
+                "delta":      match.get("processor_delta_detail",""),
+            })
+
+        icon  = "✅" if match["matched"] else "❌"
+        ghost = " ⚑" if constraint.get("is_ghost_rule") else ""
+        delta = " ⚠️" if match.get("processor_delta") else ""
+        print(f"  {icon}{ghost}{delta} {match['match_strength']:<10} "
+              f"{match['recommendation']:<18} {constraint['statement'][:45]}")
+
+    if constraint_count >= MAX_CONSTRAINTS:
+        print(f"\n⏸  Limit reached — increase MAX_CONSTRAINTS to process more")
+        break
+
+print(f"\n✅ Matched={len(requirement_map)}  Gaps={len(gaps)}  "
+      f"Ghost={len(ghost_confirmations)}  Deltas={len(processor_deltas)}")
+
+
+
+
+
+
+
+
+
+
+print("=" * 65)
+print("❌ GAPS — no documentation backing")
+print("=" * 65)
+if gaps:
+    for i, g in enumerate(gaps, 1):
+        print(f"\n  {i}. {g['node']}  ({g['file']})")
+        print(f"     Constraint : {g['constraint']}")
+        print(f"     Reason     : {g['gap_reason']}")
+        print(f"     Action     : {g['recommendation']}")
+else:
+    print("  None ✅")
+
+print(f"\n{'='*65}")
+print("⚑  GHOST RULES")
+print("=" * 65)
+if ghost_confirmations:
+    for i, g in enumerate(ghost_confirmations, 1):
+        status = "✅ confirmed" if g["confirmed"] else "❓ not in docs"
+        print(f"\n  {i}. {g['node']}")
+        print(f"     Rule     : {g['constraint']}")
+        print(f"     Status   : {status}")
+        print(f"     Evidence : {g['evidence'][:100]}")
+        print(f"     Action   : {g['recommendation']}")
+else:
+    print("  None")
+
+print(f"\n{'='*65}")
+if PROCESSOR_B_IN_SCOPE:
+    print("⚠️  PROCESSOR DELTAS (A vs B differences)")
+else:
+    print("⚠️  CONSTRAINT DEVIATIONS (code vs documented rules)")
+print("=" * 65)
+if processor_deltas:
+    for i, d in enumerate(processor_deltas, 1):
+        print(f"\n  {i}. {d['node']}")
+        print(f"     Constraint : {d['constraint']}")
+        print(f"     Detail     : {d['delta']}")
+else:
+    print("  None")
+
+
+
+
+
+
+
+
+
+PROCESSOR_PROFILE_PROMPT = """You are the Librarian agent extracting a structured
+integration profile for a payment processor from its documentation.
+
+Processor name : {processor_name}
+Role           : {role}
+Documentation  :
+{doc_text}
+
+Code constraints that reveal actual behaviour:
+{code_constraints}
+
+Return JSON:
+{{
+  "processor_id":   "{processor_id}",
+  "processor_name": "{processor_name}",
+  "role":           "{role}",
+  "integration_points": [
+    {{
+      "point_id":       "IP-001",
+      "operation":      "submit_payment",
+      "direction":      "outbound",
+      "pattern":        "rest_api | soap_wsdl | message_queue | file_based | iso20022 | ach_nacha",
+      "endpoint":       "/api/v1/payments",
+      "http_method":    "POST",
+      "message_format": "JSON | XML | NACHA | ISO20022",
+      "authentication": "OAuth2 | mTLS | API_Key | Basic | HMAC",
+      "protocol":       "HTTPS | AMQP | SFTP | MQ",
+      "sla_seconds":    5,
+      "is_synchronous": true,
+      "description":    "what this does"
+    }}
+  ],
+  "error_codes":        {{"SETTLED_99": "accepted"}},
+  "settlement_windows": ["same-day if before 14:00 ET"],
+  "auth_mechanisms":    ["API_Key"],
+  "supported_protocols":["HTTPS"],
+  "message_formats":    ["JSON"],
+  "known_timeouts": {{
+    "api_response_ms":       5000,
+    "connection_timeout_ms": 3000
+  }},
+  "doc_coverage_score": 0.85,
+  "gaps": ["undocumented areas"]
+}}
+
+Respond ONLY with valid JSON. No markdown fences."""
+
+
+def extract_processor_profile(processor_id, processor_name,
+                               role, doc_labels, code_constraints):
+    combined = ""
+    for label in doc_labels:
+        if label in documents:
+            combined += f"\n\n--- {label} ---\n{documents[label][:4000]}"
+
+    if not combined:
+        print(f"  ⚠️  No documents for {processor_name}")
+        return None
+
+    prompt = PROCESSOR_PROFILE_PROMPT.format(
+        processor_id   = processor_id,
+        processor_name = processor_name,
+        role           = role,
+        doc_text       = combined[:8000],
+        code_constraints = "\n".join(f"- {c}" for c in code_constraints[:20]),
+    )
+    try:
+        response = model.generate_content(prompt, generation_config=gen_config)
+        raw = response.text.strip()
+        raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+        raw = re.sub(r"\n?```\s*$", "", raw)
+        result = json.loads(raw)
+        result["processor_id"]   = processor_id
+        result["processor_name"] = processor_name
+        result["role"]           = role
+        return result
+    except Exception as e:
+        print(f"  ❌ {e}")
+        return None
+
+
+# Collect vendor-related constraints from Auditor output
+vendor_constraints = [
+    c.get("statement","")
+    for entry in constraint_model["constraint_map"].values()
+    for c in entry.get("audit_result",{}).get("constraints",[])
+    if c.get("assumes_vendor_behaviour")
+]
+print(f"Vendor constraints from code: {len(vendor_constraints)}")
+
+# ── Processor A — always extract ──────────────────────────────────
+print(f"\n{'─'*60}")
+print("Extracting Processor A profile...")
+processor_a_profile = extract_processor_profile(
+    processor_id    = "processor_a",
+    processor_name  = "Processor A",
+    role            = "source",
+    doc_labels      = ["processor_a_guide", "architecture_doc"],
+    code_constraints = vendor_constraints,
+)
+if processor_a_profile:
+    ips = processor_a_profile.get("integration_points", [])
+    print(f"  ✅ {len(ips)} integration points  "
+          f"coverage={processor_a_profile.get('doc_coverage_score',0)}")
+    for ip in ips:
+        print(f"     [{ip.get('point_id')}] {ip.get('operation'):<25} "
+              f"{ip.get('pattern'):<15} SLA={ip.get('sla_seconds')}s")
+
+# ── Processor B — only when in scope ──────────────────────────────
+processor_b_profile = None
+
+if PROCESSOR_B_IN_SCOPE:
+    print(f"\n{'─'*60}")
+    print("Extracting Processor B profile...")
+    processor_b_profile = extract_processor_profile(
+        processor_id    = "processor_b",
+        processor_name  = "Processor B",
+        role            = "target",
+        doc_labels      = ["processor_b_guide"],
+        code_constraints = [],
+    )
+    if processor_b_profile:
+        ips = processor_b_profile.get("integration_points", [])
+        print(f"  ✅ {len(ips)} integration points  "
+              f"coverage={processor_b_profile.get('doc_coverage_score',0)}")
+        for ip in ips:
+            print(f"     [{ip.get('point_id')}] {ip.get('operation'):<25} "
+                  f"{ip.get('pattern'):<15} SLA={ip.get('sla_seconds')}s")
+else:
+    print(f"\n⏭  Processor B not in scope — skipping profile")]
+
+
+
+
+
+
+
+
+
+migration_delta          = None
+modernisation_assessment = None
+
+# ── PATH A: Processor migration ────────────────────────────────────
+if PROCESSOR_B_IN_SCOPE:
+    print("Computing migration delta: Processor A → Processor B...\n")
+
+    MIGRATION_DELTA_PROMPT = """Compare these two payment processor profiles
+and compute the exact migration delta.
+
+PROCESSOR A (source — being replaced):
+{processor_a}
+
+PROCESSOR B (target — replacement):
+{processor_b}
+
+Return JSON:
+{{
+  "unchanged_integration_points": [
+    {{"operation":"...", "reason":"...", "a_point_id":"IP-001", "b_point_id":"IP-001"}}
+  ],
+  "changed_integration_points": [
+    {{"operation":"...", "a_point_id":"IP-001", "b_point_id":"IP-002",
+      "what_changed":"...", "impact":"...", "effort":"low | medium | high"}}
+  ],
+  "removed_integration_points": [
+    {{"operation":"...", "a_point_id":"IP-003", "reason":"...", "impact":"..."}}
+  ],
+  "new_integration_points": [
+    {{"operation":"...", "b_point_id":"IP-004", "reason":"...", "impact":"..."}}
+  ],
+  "temporal_changes": [
+    {{"type":"settlement_window | timeout | retry",
+      "a_value":"14:00 ET", "b_value":"15:00 ET",
+      "impact":"...", "risk":"low | medium | high | critical"}}
+  ],
+  "auth_changes": {{
+    "changed":true, "a_auth":"API Key", "b_auth":"OAuth2", "impact":"..."
+  }},
+  "error_code_mapping": [
+    {{"a_code":"SETTLED_99", "b_code":"ACCEPTED",
+      "same_meaning":true, "action":"replace string literal"}}
+  ],
+  "overall_complexity":        "low | medium | high | very_high",
+  "migration_summary":         "2-3 sentences",
+  "services_likely_impacted":  ["adapter-service"],
+  "services_likely_safe":      ["audit-service"]
+}}
+
+Respond ONLY with valid JSON. No markdown fences."""
+
+    def compute_migration_delta(proc_a, proc_b):
+        def slim(p):
+            return {
+                "integration_points":  p.get("integration_points",[]),
+                "error_codes":         p.get("error_codes",{}),
+                "settlement_windows":  p.get("settlement_windows",[]),
+                "auth_mechanisms":     p.get("auth_mechanisms",[]),
+                "known_timeouts":      p.get("known_timeouts",{}),
+            }
+        prompt = MIGRATION_DELTA_PROMPT.format(
+            processor_a = json.dumps(slim(proc_a), indent=2),
+            processor_b = json.dumps(slim(proc_b), indent=2),
+        )
+        try:
+            response = model.generate_content(prompt, generation_config=gen_config)
+            raw = response.text.strip()
+            raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+            raw = re.sub(r"\n?```\s*$", "", raw)
+            return json.loads(raw)
+        except Exception as e:
+            print(f"❌ Delta error: {e}")
+            return None
+
+    if processor_a_profile and processor_b_profile:
+        migration_delta = compute_migration_delta(
+            processor_a_profile, processor_b_profile
+        )
+        if migration_delta:
+            unchanged = migration_delta.get("unchanged_integration_points",[])
+            changed   = migration_delta.get("changed_integration_points",[])
+            removed   = migration_delta.get("removed_integration_points",[])
+            new       = migration_delta.get("new_integration_points",[])
+            temporal  = migration_delta.get("temporal_changes",[])
+
+            print(f"{'='*65}")
+            print(f"MIGRATION DELTA: Processor A → Processor B")
+            print(f"{'='*65}")
+            print(f"  Complexity  : {migration_delta.get('overall_complexity')}")
+            print(f"  Summary     : {migration_delta.get('migration_summary')}")
+            print(f"\n  Unchanged   : {len(unchanged)}")
+            print(f"  Changed     : {len(changed)}")
+            print(f"  Removed     : {len(removed)}")
+            print(f"  New         : {len(new)}")
+            print(f"  Temporal    : {len(temporal)}")
+
+            if changed:
+                print(f"\n  Changed points:")
+                for c in changed:
+                    print(f"    {c.get('operation'):<30} effort={c.get('effort')}")
+                    print(f"      {c.get('what_changed')}")
+
+            if temporal:
+                print(f"\n  Temporal changes:")
+                for t in temporal:
+                    print(f"    [{t.get('type')}]  risk={t.get('risk')}")
+                    print(f"      A={t.get('a_value')}  →  B={t.get('b_value')}")
+
+            auth = migration_delta.get("auth_changes",{})
+            if auth.get("changed"):
+                print(f"\n  Auth: {auth.get('a_auth')} → {auth.get('b_auth')}")
+                print(f"    {auth.get('impact')}")
+
+            for e in migration_delta.get("error_code_mapping",[]):
+                print(f"  Error code: {e.get('a_code')} → {e.get('b_code')}  "
+                      f"action={e.get('action')}")
+
+            print(f"\n  Services impacted : {migration_delta.get('services_likely_impacted')}")
+            print(f"  Services safe     : {migration_delta.get('services_likely_safe')}")
+    else:
+        print("⚠️  Cannot compute delta — missing processor profile(s)")
+
+# ── PATH B: Code modernisation only ───────────────────────────────
+else:
+    print("Running modernisation readiness assessment...\n")
+
+    MODERNISATION_PROMPT = """You are the Librarian agent assessing code modernisation readiness.
+There is no processor migration — the code must be modernised while
+preserving all behaviour exactly.
+
+DOCUMENTED REQUIREMENTS:
+{requirements}
+
+CONSTRAINTS FROM CODE:
+{constraints}
+
+GHOST RULES:
+{ghost_rules}
+
+GAPS (no doc backing):
+{gaps}
+
+Return JSON:
+{{
+  "modernisation_risks": [
+    {{
+      "risk_id":   "MR-001",
+      "category":  "ghost_rule | undocumented | deviation | tech_debt | ambiguous",
+      "description":"what the risk is",
+      "location":  "file or method",
+      "impact":    "what breaks if ignored",
+      "action":    "DOCUMENT_FIRST | SME_REVIEW | SAFE_TO_MODERNISE | PRESERVE_EXACTLY",
+      "priority":  "critical | high | medium | low"
+    }}
+  ],
+  "safe_to_modernise": [
+    {{"node":"method name", "reason":"fully documented, no ghost rules"}}
+  ],
+  "must_preserve_exactly": [
+    {{"node":"method name", "reason":"ghost rule or undocumented behaviour"}}
+  ],
+  "needs_documentation_first": [
+    {{"node":"method name", "what":"what to document", "by_whom":"SME | BA | architect"}}
+  ],
+  "tech_debt_found": [
+    {{"location":"file/method", "description":"debt description",
+      "modernisation_opportunity":"how to fix in new code"}}
+  ],
+  "overall_readiness": "ready | needs_work | blocked",
+  "readiness_summary": "2-3 sentences"
+}}
+
+Respond ONLY with valid JSON. No markdown fences."""
+
+    all_constraints_text = "\n".join(
+        f"{nm}: {c.get('statement','')}"
+        for nm, entry in constraint_model["constraint_map"].items()
+        for c in entry.get("audit_result",{}).get("constraints",[])
+    )
+    ghost_text = "\n".join(
+        f"- {g['node']}: {g['constraint']}"
+        for g in constraint_model.get("ghost_rules",[])
+    )
+    gap_text = "\n".join(
+        f"- {g['node']}: {g['constraint']}"
+        for g in gaps
+    )
+    req_text = "\n".join(
+        f"[{r['req_id']}] {r['statement']}"
+        for r in all_requirements[:30]
+    )
+
+    prompt = MODERNISATION_PROMPT.format(
+        requirements = req_text,
+        constraints  = all_constraints_text[:4000],
+        ghost_rules  = ghost_text or "None",
+        gaps         = gap_text   or "None",
+    )
+
+    try:
+        response = model.generate_content(prompt, generation_config=gen_config)
+        raw = response.text.strip()
+        raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+        raw = re.sub(r"\n?```\s*$", "", raw)
+        modernisation_assessment = json.loads(raw)
+
+        safe  = modernisation_assessment.get("safe_to_modernise",[])
+        exact = modernisation_assessment.get("must_preserve_exactly",[])
+        doc   = modernisation_assessment.get("needs_documentation_first",[])
+        risks = modernisation_assessment.get("modernisation_risks",[])
+        debt  = modernisation_assessment.get("tech_debt_found",[])
+
+        print(f"{'='*65}")
+        print(f"MODERNISATION READINESS ASSESSMENT")
+        print(f"{'='*65}")
+        print(f"  Readiness   : {modernisation_assessment.get('overall_readiness')}")
+        print(f"  Summary     : {modernisation_assessment.get('readiness_summary')}")
+        print(f"\n  ✅ Safe to modernise      : {len(safe)}")
+        for s in safe[:5]:
+            print(f"     {s['node']:<35} {s['reason'][:50]}")
+        print(f"\n  🔒 Must preserve exactly  : {len(exact)}")
+        for e in exact[:5]:
+            print(f"     {e['node']:<35} {e['reason'][:50]}")
+        print(f"\n  📝 Needs documentation    : {len(doc)}")
+        for d in doc[:5]:
+            print(f"     {d['node']:<30} {d['what'][:40]}  by={d['by_whom']}")
+        print(f"\n  ⚠️  Risks                  : {len(risks)}")
+        for r in sorted(risks, key=lambda x: x.get("priority","low")):
+            print(f"     [{r.get('priority','?'):<8}] {r['description'][:55]}")
+            print(f"     {'':12} Action: {r.get('action')}")
+        print(f"\n  🔧 Tech debt              : {len(debt)}")
+        for t in debt[:5]:
+            print(f"     {t['location']}")
+            print(f"       → {t['modernisation_opportunity'][:65]}")
+
+    except Exception as e:
+        print(f"❌ Assessment error: {e}")
+
+
+
+
+
+
+
+
+
+
+
+# Pull temporal constraints from Auditor output
+temporal_assumptions_from_code = []
+for node_name, entry in constraint_model["constraint_map"].items():
+    for c in entry.get("audit_result",{}).get("constraints",[]):
+        if c.get("type") == "temporal":
+            temporal_assumptions_from_code.append({
+                "node":       node_name,
+                "file":       entry.get("node",{}).get("file",""),
+                "statement":  c.get("statement",""),
+                "confidence": c.get("confidence",""),
+            })
+
+temporal_at_risk = []
+
+print(f"{'='*65}")
+print(f"⏱  TEMPORAL ASSUMPTIONS")
+print(f"{'='*65}")
+print(f"Mode: {'Processor Migration — cross-reference against B SLAs' if PROCESSOR_B_IN_SCOPE else 'Code Modernisation — flag as configurable tech debt'}\n")
+
+if PROCESSOR_B_IN_SCOPE and migration_delta:
+    # Cross-reference against delta temporal changes
+    delta_temporal = migration_delta.get("temporal_changes",[])
+    for assumption in temporal_assumptions_from_code:
+        risk_found = False
+        for dt in delta_temporal:
+            stmt = assumption["statement"].lower()
+            if any(kw in stmt for kw in ["timeout","retry","schedule",
+                                          "cutoff","window","interval","delay"]):
+                temporal_at_risk.append({
+                    "node":            assumption["node"],
+                    "file":            assumption["file"],
+                    "code_assumption": assumption["statement"],
+                    "delta_type":      dt.get("type"),
+                    "processor_a_val": dt.get("a_value"),
+                    "processor_b_val": dt.get("b_value"),
+                    "delta_impact":    dt.get("impact"),
+                    "risk":            dt.get("risk"),
+                    "action":          "Update to Processor B value",
+                    "requires_human_review": True,
+                })
+                risk_found = True
+                break
+        if not risk_found:
+            temporal_at_risk.append({
+                "node":            assumption["node"],
+                "file":            assumption["file"],
+                "code_assumption": assumption["statement"],
+                "delta_type":      "unverified",
+                "processor_a_val": "in code",
+                "processor_b_val": "verify against Processor B docs",
+                "delta_impact":    "unknown",
+                "risk":            "medium",
+                "action":          "Verify against Processor B documentation",
+                "requires_human_review": True,
+            })
+else:
+    # Modernisation mode — all temporal assumptions become tech debt
+    for assumption in temporal_assumptions_from_code:
+        temporal_at_risk.append({
+            "node":            assumption["node"],
+            "file":            assumption["file"],
+            "code_assumption": assumption["statement"],
+            "delta_type":      "tech_debt",
+            "processor_a_val": "hardcoded in source",
+            "processor_b_val": "n/a",
+            "delta_impact":    "Should be extracted to config/environment variable",
+            "risk":            "low",
+            "action":          "Extract to configuration — do not hardcode in modernised code",
+            "requires_human_review": False,
+        })
+
+if temporal_at_risk:
+    for i, t in enumerate(temporal_at_risk, 1):
+        print(f"  {i}. {t['node']}  ({t['file']})")
+        print(f"     Code    : {t['code_assumption']}")
+        print(f"     A value : {t['processor_a_val']}")
+        if PROCESSOR_B_IN_SCOPE:
+            print(f"     B value : {t['processor_b_val']}")
+            print(f"     Risk    : {t['risk']}")
+        print(f"     Action  : {t['action']}\n")
+else:
+    print("  None detected")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+semantic_map = {
+    "artifact_id":  hashlib.md5(f"librarian-{time.time()}".encode()).hexdigest()[:12],
+    "source_artifact_ids": {
+        "archeologist": structural_map["artifact_id"],
+        "auditor":      constraint_model["artifact_id"],
+    },
+    "repo_url":              structural_map["repo_url"],
+    "created_at":            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "mode":                  "processor_migration" if PROCESSOR_B_IN_SCOPE else "code_modernisation",
+    "processor_b_in_scope":  PROCESSOR_B_IN_SCOPE,
+
+    # Always present
+    "requirement_map":       requirement_map,
+    "gaps":                  gaps,
+    "ghost_confirmations":   ghost_confirmations,
+    "processor_deltas":      processor_deltas,
+    "all_requirements":      all_requirements,
+    "glossary":              glossary,
+    "processor_a_profile":   processor_a_profile,
+    "temporal_at_risk":      temporal_at_risk,
+
+    # Mode-specific — one will be None
+    "processor_b_profile":      processor_b_profile,
+    "migration_delta":          migration_delta,
+    "modernisation_assessment": modernisation_assessment,
+
+    # Service impact — derived from whichever mode ran
+    "services_requiring_changes": (
+        migration_delta.get("services_likely_impacted",[])
+        if PROCESSOR_B_IN_SCOPE and migration_delta
+        else [s["node"] for s in
+              (modernisation_assessment or {}).get("must_preserve_exactly",[])]
+    ),
+    "services_untouched": (
+        migration_delta.get("services_likely_safe",[])
+        if PROCESSOR_B_IN_SCOPE and migration_delta
+        else [s["node"] for s in
+              (modernisation_assessment or {}).get("safe_to_modernise",[])]
+    ),
+
+    "summary": {
+        "mode":                          "processor_migration" if PROCESSOR_B_IN_SCOPE else "code_modernisation",
+        "total_constraints_matched":     len(requirement_map),
+        "total_gaps":                    len(gaps),
+        "ghost_rules_confirmed":         sum(1 for g in ghost_confirmations if g["confirmed"]),
+        "ghost_rules_unconfirmed":       sum(1 for g in ghost_confirmations if not g["confirmed"]),
+        "processor_deltas_found":        len(processor_deltas),
+        "docs_analysed":                 len(documents),
+        "requirements_extracted":        len(all_requirements),
+        "glossary_terms":                len(glossary),
+        "processor_a_integration_points":len(processor_a_profile.get("integration_points",[]))
+                                         if processor_a_profile else 0,
+        "processor_b_integration_points":len(processor_b_profile.get("integration_points",[]))
+                                         if processor_b_profile else 0,
+        "temporal_assumptions":          len(temporal_at_risk),
+        "services_requiring_changes":    len(semantic_map["services_requiring_changes"])
+                                         if "services_requiring_changes" in locals() else 0,
+    }
+}
+
+# Add mode-specific summary block
+if PROCESSOR_B_IN_SCOPE and migration_delta:
+    semantic_map["summary"]["migration_delta"] = {
+        "unchanged":  len(migration_delta.get("unchanged_integration_points",[])),
+        "changed":    len(migration_delta.get("changed_integration_points",[])),
+        "removed":    len(migration_delta.get("removed_integration_points",[])),
+        "new":        len(migration_delta.get("new_integration_points",[])),
+        "complexity": migration_delta.get("overall_complexity","unknown"),
+    }
+elif not PROCESSOR_B_IN_SCOPE and modernisation_assessment:
+    semantic_map["summary"]["modernisation"] = {
+        "readiness":             modernisation_assessment.get("overall_readiness"),
+        "safe_to_modernise":     len(modernisation_assessment.get("safe_to_modernise",[])),
+        "must_preserve_exactly": len(modernisation_assessment.get("must_preserve_exactly",[])),
+        "needs_documentation":   len(modernisation_assessment.get("needs_documentation_first",[])),
+        "tech_debt_items":       len(modernisation_assessment.get("tech_debt_found",[])),
+        "risks":                 len(modernisation_assessment.get("modernisation_risks",[])),
+    }
+
+# SHA-256
+payload = json.dumps(semantic_map, sort_keys=True, default=str)
+semantic_map["sha256"] = hashlib.sha256(payload.encode()).hexdigest()
+
+with open("/tmp/semantic_map.json", "w") as f:
+    json.dump(semantic_map, f, indent=2, default=str)
+
+print("=" * 65)
+print(f"ARTIFACT ③ — Semantic Requirement Map")
+print(f"Mode : {'Processor Migration' if PROCESSOR_B_IN_SCOPE else 'Code Modernisation'}")
+print("=" * 65)
+print(f"  artifact_id          : {semantic_map['artifact_id']}")
+print(f"  sha256               : {semantic_map['sha256'][:32]}...")
+print(f"  constraints matched  : {semantic_map['summary']['total_constraints_matched']}")
+print(f"  gaps                 : {semantic_map['summary']['total_gaps']}")
+print(f"  ghost confirmed      : {semantic_map['summary']['ghost_rules_confirmed']}")
+print(f"  ghost unconfirmed    : {semantic_map['summary']['ghost_rules_unconfirmed']}")
+print(f"  temporal assumptions : {semantic_map['summary']['temporal_assumptions']}")
+
+if PROCESSOR_B_IN_SCOPE:
+    d = semantic_map["summary"].get("migration_delta",{})
+    print(f"\n  Migration delta:")
+    print(f"    unchanged  : {d.get('unchanged',0)}")
+    print(f"    changed    : {d.get('changed',0)}")
+    print(f"    removed    : {d.get('removed',0)}")
+    print(f"    new        : {d.get('new',0)}")
+    print(f"    complexity : {d.get('complexity','n/a')}")
+else:
+    m = semantic_map["summary"].get("modernisation",{})
+    print(f"\n  Modernisation:")
+    print(f"    readiness            : {m.get('readiness','n/a')}")
+    print(f"    safe to modernise    : {m.get('safe_to_modernise',0)}")
+    print(f"    must preserve        : {m.get('must_preserve_exactly',0)}")
+    print(f"    needs documentation  : {m.get('needs_documentation',0)}")
+    print(f"    tech debt items      : {m.get('tech_debt_items',0)}")
+
+print(f"\n✅ Artifact ③ saved to /tmp/semantic_map.json")
+print(f"   Next: Cartographer reads mode='{semantic_map['mode']}' and acts accordingly")
+
+
+
+
+
+
+
+
